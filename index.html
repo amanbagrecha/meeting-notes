@@ -397,8 +397,8 @@ function asrModels() {
   const row = S.catalog && S.catalog.capabilities.find(c => c.capability === "automatic-speech-recognition");
   return row ? row.models.filter(m => m.downloaded) : [];
 }
-function liveModel() { // smallest downloaded, prefer "small"
-  const ms = asrModels(); const sm = ms.find(m => /small/i.test(m.id)) || ms.sort((a, b) => (a.size_gb || 0) - (b.size_gb || 0))[0];
+function liveModel() { // fastest downloaded: the live draft is replaced by the final pass anyway
+  const ms = asrModels(); const sm = ms.find(m => /tiny/i.test(m.id)) || ms.find(m => /small/i.test(m.id)) || ms.sort((a, b) => (a.size_gb || 0) - (b.size_gb || 0))[0];
   return sm ? sm.id : undefined;
 }
 function finalModel() { // recommended, else largest downloaded
