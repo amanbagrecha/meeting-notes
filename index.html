@@ -440,16 +440,17 @@ async function finishStale() { // recorder died while away: wrap what exists and
 
 async function finalPass() {
   if (!S.cur || !S.rec.wav) { S.phase = "idle"; await saveCur({status: "done"}); render(); return; }
-  const my = seq, id = S.cur.id;
-  S.phase = "transcribing"; S.progress = {done: 0, total: S.rec.seconds || null, label: "Transcribing with speaker detection…"}; render();
+  const my = seq, id = S.cur.id, run = ++finalRun;
+  S.phase = "transcribing"; S.progress = {done: 0, total: S.rec.seconds || null, label: "Starting…"}; render();
   const live = S.cur.transcript.segments;
+  const stale = () => my !== seq || run !== finalRun; // switched meeting or skipped
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
       const r = await fused.ai.transcribe({
         path: S.rec.wav, model: finalModel(), provider: "local", diarize: true,
-        onProgress: j => { if (my !== seq) return; S.progress = {done: j.done || 0, total: j.total || S.rec.seconds || null, label: j.detail || "Transcribing…"}; renderProgress(); },
+        onProgress: j => { if (stale()) return; S.progress = {done: j.done || 0, total: j.total || S.rec.seconds || null, label: j.detail || "Transcribing…"}; renderProgress(); },
       });
-      if (my !== seq) return;
+      if (stale()) return;
       const segs = r.segments.filter(s => s.text.trim()).map(s => ({start: round(s.startSecond), end: round(s.endSecond), text: s.text.trim(), speaker: s.speaker || null}));
       const speakers = (r.speakers && r.speakers.length) ? r.speakers : [...new Set(segs.map(s => s.speaker).filter(Boolean))];
       S.cur.transcript = {segments: segs.length ? segs : live, speakers, final: segs.length > 0, model: r.response && r.response.modelId || null, language: r.language || null};
@@ -458,13 +459,24 @@ async function finalPass() {
       if (segs.length) await generateSummary();
       return;
     } catch (e) {
-      if (my !== seq) return;
+      if (stale()) return;
       if (e && e.type === "model_loading" && e.jobId) { await waitJob(e.jobId, "Loading speech model…"); continue; }
       S.phase = "idle"; S.progress = null; S.rec.error = "Final transcription failed: " + (e.message || e);
       await saveCur({status: "done"}); render(); return;
     }
   }
   S.phase = "idle"; S.progress = null; render();
+}
+
+// Keep the live draft (no speaker labels) and go straight to the summary.
+let finalRun = 0;
+async function skipFinal() {
+  if (!S.cur || S.phase !== "transcribing") return;
+  finalRun++;
+  S.phase = "idle"; S.progress = null;
+  await saveCur({status: "done"});
+  render();
+  if (S.cur.transcript.segments.length) await generateSummary();
 }
 
 async function waitJob(jobId, label) {
@@ -722,8 +734,10 @@ function renderCard() {
   } else if (ph === "finishing") {
     right = `<span class="hint">Stopping…</span>`; sub = "Wrapping up the recording.";
   } else if (ph === "transcribing" || ph === "summarizing") {
-    right = `<span class="hint" id="prog-label">${esc(S.progress ? S.progress.label : "")}</span>`;
-    sub = ph === "transcribing" ? "Running the full recording through the local speech model with speaker detection." : "The local language model is writing your notes.";
+    right = `<span class="hint" id="prog-label">${esc(S.progress ? S.progress.label : "")}</span>${ph === "transcribing" && S.cur.transcript.segments.length ? `<button class="btn small" id="skip-btn" title="Keep the live transcript without speaker labels and summarize now">Skip</button>` : ""}`;
+    sub = ph === "transcribing"
+      ? (S.cur.transcript.segments.length ? "Step 1 of 2: re-reading the whole recording with the large speech model to label who said what and fix live-transcript errors. Then the summary is written." : "Step 1 of 2: transcribing the recording and labelling speakers. Then the summary is written.")
+      : "Step 2 of 2: the local language model is writing your notes.";
     extra = `<div class="progress ${S.progress && S.progress.total ? "" : "indet"}"><div id="prog-bar"></div></div>`;
   } else if (!caps.available) {
     right = `<button class="btn primary" disabled>Record</button>`;
@@ -741,6 +755,7 @@ function renderCard() {
   const r = $("#rec-btn"); if (r) r.addEventListener("click", startRecording);
   const s = $("#stop-btn"); if (s) s.addEventListener("click", stopRecording);
   const f = $("#finish-btn"); if (f) f.addEventListener("click", finishStale);
+  const k = $("#skip-btn"); if (k) k.addEventListener("click", skipFinal);
   const d = $("#dev-link"); if (d) d.addEventListener("click", e => { e.stopPropagation(); openSettings(); });
   renderQuiet();
   renderProgress();
