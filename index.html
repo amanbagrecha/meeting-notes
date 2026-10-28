@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html data-fused-theme="shell">
+<head>
+<meta charset="utf-8" />
+<!-- Declares this page a fused app's entry — keep it near the top of <head>
+     (detection reads only the first 4 KiB). -->
+<meta name="fused-app" />
+<!-- The fused page API version this app was authored against (see
+     fused_render/fused_api_version.py). The app page offers a "Migrate"
+     task when the runtime has moved past it. -->
+<meta name="fused-api-version" content="1" />
+<meta name="fused-app-id" content="meeting-notes-77a2a41b" />
+<title>New app</title>
+<style>
+  /* --fused-* come from the shell (colour preset + light/dark); the literals are
+     the standalone fallbacks. See the fused-render-theming skill. */
+  :root       { color-scheme: dark;  --bg: var(--fused-bg, #101318); --text: var(--fused-fg, #dce2ea); --muted: var(--fused-fg-muted, #9aa0a6); --line: var(--fused-border, #2a303a); }
+  :root[data-theme="light"]
+              { color-scheme: light; --bg: var(--fused-bg, #f7f8fa); --text: var(--fused-fg, #1a1f27); --muted: var(--fused-fg-muted, #5f6672); --line: var(--fused-border, #d8dce3); }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    font-size: 14px;
+    color: var(--text);
+    background: var(--bg);
+  }
+  main { max-width: 640px; margin: 0 auto; padding: 48px 24px; }
+  h1 { font-size: 18px; margin: 0 0 12px; }
+  p  { color: var(--muted); line-height: 1.5; }
+  code {
+    font-family: ui-monospace, Menlo, Consolas, monospace;
+    font-size: 12px;
+    border: 1px solid var(--line);
+    border-radius: 4px;
+    padding: 1px 5px;
+  }
+</style>
+</head>
+<body>
+  <!-- This is the app's entry view. The shell injects the `fused` runtime
+       (params, runPython, readFile, …) — no <script src> or network needed.
+       Replace everything below; see CLAUDE.md and .claude/skills/ for the
+       full authoring contract. -->
+  <main>
+    <h1>New fused-render app</h1>
+    <p>
+      Edit <code>index.html</code> to build this app. Put view state in
+      <code>fused.params</code> (it syncs to the URL), and compute with
+      <code>fused.runPython("./file.py", { ... })</code>.
+    </p>
+  </main>
+  <script>
+    // Params are the state; controls write params; onChange re-renders.
+    function draw() {}
+    fused.params.onChange(draw);
+    draw();
+  </script>
+</body>
+</html>

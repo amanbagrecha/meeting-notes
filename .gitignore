@@ -1,0 +1,6 @@
+*.html.json
+.claude-split.json
+.venv/
+.fused/
+.fused-render-write-probe.*
+__pycache__/
