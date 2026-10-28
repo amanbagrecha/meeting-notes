@@ -1,0 +1,46 @@
+# Meeting notes — scope
+
+Local-only meeting recorder modelled on Notion's AI Meeting Notes: one click to
+record, a transcript that fills in while the call runs, and an AI-written
+summary with action items when it ends. Every model runs on this machine.
+
+## What was found on this machine (2026-10-28)
+
+| Need | What exists | Decision |
+|---|---|---|
+| System audio capture | Linux + PipeWire. `fused.capture.audio({source:"system"})` is refused on Linux; `fused.capture.screen({audio:"system"})` needs a browser share picker and records video too. `ffmpeg -f pulse` on the default sink's `.monitor` and the mic works and survives a `runPython` return when started detached (verified). | **Native PipeWire capture via ffmpeg**, spawned detached by `recorder.py`. Mixes system audio + mic into one 16 kHz mono WAV. Mic is optional. |
+| Transcription | fused-render's local `faster-whisper` runner (CTranslate2, CPU). `faster-whisper-small` and `large-v3-turbo` already downloaded. | **`fused.ai.transcribe`**, small model for live chunks, large-v3-turbo for the final pass. |
+| Speaker detection | `diarize: true` on transcribe runs sherpa-onnx pyannote segmentation + speaker embeddings (already downloaded). | **Diarize on the final pass**; labels `Speaker 1..N`, user can rename. Live chunks are not diarized (too short). |
+| Summary | local `llama.cpp` (Vulkan, Radeon RX 9060 XT). `Qwen3.5-4B-Q4_K_M.gguf` downloaded, recommended. Context = 8192 tokens. | **`fused.ai.text` with the catalog's recommended local text model**. Long transcripts are summarised in chunks, then merged. No cloud provider ever. |
+| Storage | `.fused/data/` | One folder per meeting: `audio.wav`, `meeting.json` (title, notes, transcript, summary, speaker names). |
+
+## Notion feature parity
+
+Notion AI Meeting Notes gives: a start-recording block, live transcript beside
+your own notes, speaker labels, summary templates (Auto, Standup, Sales call,
+Interview, Team meeting…), a "Next steps" checklist, and a Transcript tab with
+timestamps. Mapped here:
+
+- **Record / Stop** on the meeting page. Elapsed time and level of activity shown. The recording also appears as a download-manager job row so it survives navigation.
+- **Live transcript**: every ~20 s the new slice of audio is transcribed and appended.
+- **Final pass** at stop: whole file re-transcribed with the big model + diarization, replacing the live text.
+- **Summary** with a format picker (Auto, Standup, 1:1, Sales call, Interview, Brainstorm) producing: Summary, Key points, Decisions, Action items (checkboxes), Open questions.
+- **Your notes**: a free-text area that is saved with the meeting and fed to the summariser as context.
+- **Transcript tab**: speaker-coloured, timestamped, click-to-rename speakers, search.
+- **Meetings sidebar**: list, new, delete, title edit.
+- **Copy as Markdown** for pasting into Notion or anywhere.
+
+## Out of scope (v1)
+
+- Calendar detection of meetings, auto-start.
+- Separate per-speaker tracks ("You" vs remote) — mixed track for now; a later version can keep the mic as its own track to label the user for free.
+- Windows / macOS paths (the recorder is PipeWire-specific; the page shows a clear "needs PipeWire" state elsewhere).
+- Translation, multi-language summaries, export to Notion API.
+
+## Files
+
+- `index.html` — the whole UI.
+- `recorder.py` — start / status / stop / slice of the ffmpeg capture; device listing.
+- `meetings.py` — CRUD over `.fused/data/meetings/<id>/meeting.json`.
+- `SKILL.md` — bot-callable description of the two `.py` files.
+- `pyproject.toml` — stdlib only.
