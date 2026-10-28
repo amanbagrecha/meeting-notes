@@ -93,10 +93,11 @@
   .card .lead .ico svg { width: 18px; height: 18px; }
   .card .lead .txt { min-width: 0; }
   .card .lead .txt b { display: block; font-weight: 600; }
-  .card .lead .txt span { color: var(--muted); font-size: 12.5px; display: block; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .card .lead .txt span { color: var(--muted); font-size: 12.5px; display: block; overflow-wrap: anywhere; }
   .timer { font-variant-numeric: tabular-nums; font-weight: 600; display: inline-flex; align-items: center; gap: 8px; }
   .timer .dot { width: 9px; height: 9px; }
-  .chk { display: inline-flex; align-items: center; gap: 6px; color: var(--muted); font-size: 13px; cursor: pointer; }
+  .link { color: var(--muted); text-decoration: underline; text-underline-offset: 2px; }
+  .link:hover { color: var(--text); }
   .live { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); color: var(--muted); font-size: 13px; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden; }
   .live b { color: var(--text); font-weight: 500; }
   .warn { color: var(--rec); font-size: 13px; margin-top: 8px; }
@@ -104,6 +105,27 @@
   .progress > div { height: 100%; background: var(--accent); width: 0; transition: width 0.3s; }
   .progress.indet > div { width: 35%; animation: slide 1.2s infinite linear; }
   @keyframes slide { from { transform: translateX(-100%); } to { transform: translateX(300%); } }
+
+  /* ---- level meter: one bar per 50 ms of audio, newest on the right ---- */
+  .meter { display: inline-flex; align-items: center; gap: 2px; height: 22px; flex: none; }
+  .meter i { width: 3px; height: 100%; border-radius: 2px; background: var(--muted); opacity: 0.45; -webkit-transform: scaleY(0.08); transform: scaleY(0.08); transition: transform 60ms linear; }
+  .meter i.on { background: var(--accent); opacity: 1; }
+
+  /* ---- audio settings (bottom right) ---- */
+  .fab { position: fixed; right: 16px; bottom: 16px; z-index: 20; width: 36px; height: 36px; border-radius: 50%; border: 1px solid var(--line); background: var(--panel); color: var(--muted); display: grid; place-items: center; box-shadow: 0 2px 10px rgba(0,0,0,0.25); }
+  .fab:hover, .fab.open { color: var(--text); }
+  .fab svg { width: 18px; height: 18px; }
+  .settings { position: fixed; right: 16px; bottom: 62px; z-index: 20; width: 360px; max-width: calc(100vw - 32px); background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px 12px; box-shadow: 0 10px 30px rgba(0,0,0,0.35); }
+  .settings[hidden] { display: none; }
+  .set-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; }
+  .set-head b { font-weight: 600; }
+  .set-row { margin-bottom: 14px; }
+  .set-row label { display: block; font-weight: 500; margin-bottom: 6px; }
+  .set-row label span { color: var(--muted); font-weight: 400; }
+  .set-line { display: flex; align-items: center; gap: 10px; }
+  .set-line select { flex: 1; min-width: 0; text-overflow: ellipsis; }
+  .set-err { color: var(--rec); font-size: 12px; margin-top: 4px; }
+  .set-err:empty { display: none; }
 
   /* ---- tabs ---- */
   .tabs { display: flex; gap: 2px; border-bottom: 1px solid var(--line); margin-bottom: 18px; }
@@ -161,6 +183,8 @@
   </aside>
   <section class="main" id="main"></section>
 </div>
+<button class="fab" id="settings-btn" title="Audio settings" aria-label="Audio settings" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg></button>
+<div class="settings" id="settings" hidden></div>
 
 <script>
 "use strict";
@@ -200,6 +224,7 @@ let seq = 0; // bumps on every meeting switch so stale async work bails
 async function boot() {
   if (isPreview()) { renderPreview(); return; }
   $("#new-btn").addEventListener("click", newMeeting);
+  initSettings();
   fused.params.onChange(onParams);
   await refreshList();
   S.caps = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
@@ -288,10 +313,9 @@ async function deleteCur() {
 // ---------- recording ----------
 async function startRecording() {
   if (!S.cur || S.phase !== "idle") return;
-  const mic = $("#mic-chk") ? $("#mic-chk").checked : true;
   S.rec.error = null; S.phase = "recording"; render();
   try {
-    S.rec = await recorder({action: "start", meeting_id: S.cur.id, mic: String(mic)});
+    S.rec = await recorder({action: "start", meeting_id: S.cur.id});
   } catch (e) {
     S.phase = "idle"; S.rec.error = e.message; render(); return;
   }
@@ -303,7 +327,8 @@ async function startRecording() {
 
 function startLoops() {
   stopLoops();
-  S.pollTimer = setInterval(pollStatus, 1000);
+  S.lastBytes = S.rec.bytes || 0; S.loudAt = Date.now();
+  S.pollTimer = setInterval(pollStatus, 750);
   S.liveTimer = setInterval(liveTick, 5000);
 }
 function stopLoops() {
@@ -319,6 +344,15 @@ async function pollStatus() {
     const st = await recorder({action: "status", meeting_id: S.cur.id}, "status");
     if (my !== seq) return;
     S.rec = st;
+    // Only the windows recorded since the last poll go to the meter.
+    const fresh = Math.min(st.levels.length, Math.round((st.bytes - S.lastBytes) / 1600));
+    S.lastBytes = st.bytes;
+    if (fresh > 0) {
+      const lv = st.levels.slice(-fresh);
+      feedMeter("card-meter", lv);
+      if (lv.some(db => db > QUIET_DB)) S.loudAt = Date.now();
+    }
+    renderQuiet();
     if (!st.running) { // died on its own
       stopLoops(); S.phase = "idle"; S.rec.error = st.error || "The recorder stopped unexpectedly.";
     }
@@ -555,6 +589,125 @@ function renderMain() {
   renderCard(); renderTab();
 }
 
+// ---------- level meters ----------
+// Levels arrive in batches (one runPython per ~second, 50 ms per value), so
+// each meter queues them and a single ticker plays them back in real time.
+const METER_FLOOR = -90, QUIET_DB = -50;
+const METERS = new Map(); // element id -> {vals, queue}
+function meterHTML(id, bars = 28) { return `<span class="meter" id="${id}" aria-hidden="true">${"<i></i>".repeat(bars)}</span>`; }
+function meterState(id) { let m = METERS.get(id); if (!m) METERS.set(id, m = {vals: [], queue: []}); return m; }
+function feedMeter(id, levels) {
+  const m = meterState(id);
+  m.queue.push(...levels);
+  if (m.queue.length > 40) m.queue.splice(0, m.queue.length - 40); // never lag more than 2 s
+}
+function resetMeter(id) { METERS.delete(id); }
+setInterval(() => {
+  for (const [id, m] of METERS) {
+    if (!m.queue.length) continue;
+    m.vals.push(m.queue.shift());
+    const el = document.getElementById(id); if (!el) continue;
+    const bars = el.children, n = bars.length;
+    if (m.vals.length > n) m.vals.splice(0, m.vals.length - n);
+    const off = n - m.vals.length;
+    for (let i = 0; i < n; i++) {
+      const db = i < off ? METER_FLOOR : m.vals[i - off];
+      const v = Math.max(0.08, Math.min(1, (db + 60) / 50));
+      bars[i].style.transform = `scaleY(${v})`;
+      bars[i].classList.toggle("on", db > QUIET_DB);
+    }
+  }
+}, 50);
+
+function renderQuiet() {
+  const q = $("#quiet"); if (!q) return;
+  const silent = S.phase === "recording" && Date.now() - (S.loudAt || Date.now()) > 10000;
+  q.hidden = !silent;
+  if (silent) q.innerHTML = `No sound has reached the recorder for ${Math.round((Date.now() - S.loudAt) / 1000)}s. Check the devices in <button class="link" id="quiet-link">audio settings</button>.`;
+  const l = $("#quiet-link"); if (l) l.addEventListener("click", e => { e.stopPropagation(); openSettings(); });
+}
+
+function deviceLabel(name) {
+  if (!name) return "";
+  const d = ((S.caps && S.caps.devices) || []).find(x => x.name === name);
+  return d ? d.label : name;
+}
+
+// ---------- audio settings (bottom right) ----------
+// Picks which output's monitor and which mic get recorded, with a live meter
+// per device so you can see sound arriving before you hit Record.
+let meterRun = 0;
+function initSettings() {
+  const btn = $("#settings-btn"), panel = $("#settings");
+  btn.hidden = false;
+  btn.addEventListener("click", e => { e.stopPropagation(); panel.hidden ? openSettings() : closeSettings(); });
+  panel.addEventListener("click", e => e.stopPropagation());
+  document.addEventListener("click", () => { if (!panel.hidden) closeSettings(); });
+  document.addEventListener("keydown", e => { if (e.key === "Escape" && !panel.hidden) closeSettings(); });
+}
+async function openSettings() {
+  const panel = $("#settings");
+  panel.hidden = false; $("#settings-btn").classList.add("open");
+  renderSettings();
+  // Re-read devices: a headset may have connected since the page loaded.
+  S.caps = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
+  if (panel.hidden) return;
+  renderSettings(); renderCard();
+  meterLoop();
+}
+function closeSettings() {
+  $("#settings").hidden = true; $("#settings-btn").classList.remove("open");
+  meterRun++;
+}
+async function meterLoop() {
+  const my = ++meterRun;
+  while (my === meterRun && S.caps && S.caps.available) {
+    try {
+      const r = await recorder({action: "meter", secs: "0.8"}, "meter");
+      if (my !== meterRun) return;
+      for (const k of ["system", "mic"]) {
+        const e = $("#err-" + k); if (e) e.textContent = r[k] && r[k].error ? r[k].error : "";
+        if (r[k]) feedMeter("m-" + k, r[k].levels);
+      }
+    } catch (e) {
+      const el = $("#err-system"); if (el) el.textContent = e.message;
+      await sleep(1500);
+    }
+  }
+}
+function renderSettings() {
+  const el = $("#settings"); if (!el || el.hidden) return;
+  const head = `<div class="set-head"><b>Audio input</b><button class="btn ghost small" id="set-close">Close</button></div>`;
+  const c = S.caps;
+  if (!c || !c.available) {
+    el.innerHTML = head + `<p class="hint">${esc(c ? c.reason : "Checking devices…")}</p>`;
+  } else {
+    const devs = c.devices || [], st = c.settings || {system: "", mic: ""};
+    const opt = (v, text, sel) => `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(text)}</option>`;
+    const listed = (list, v) => !v || v === "off" || list.some(d => d.name === v) ? "" : opt(v, deviceLabel(v) + " (not connected)", v);
+    const mons = devs.filter(d => d.monitor), mics = devs.filter(d => !d.monitor);
+    const sys = opt("", `Default output (${deviceLabel(c.default_monitor)})`, st.system) + listed(mons, st.system) + mons.map(d => opt(d.name, d.label, st.system)).join("");
+    const mic = opt("", c.default_mic ? `Default input (${deviceLabel(c.default_mic)})` : "Default input (none)", st.mic) + listed(mics, st.mic) + mics.map(d => opt(d.name, d.label, st.mic)).join("") + opt("off", "Off: don't record my mic", st.mic);
+    el.innerHTML = head + `
+      <div class="set-row"><label for="set-system">System audio <span>· what others say</span></label>
+        <div class="set-line"><select class="sel" id="set-system">${sys}</select>${meterHTML("m-system", 20)}</div><div class="set-err" id="err-system"></div></div>
+      <div class="set-row"><label for="set-mic">Microphone <span>· what you say</span></label>
+        <div class="set-line"><select class="sel" id="set-mic">${mic}</select>${meterHTML("m-mic", 20)}</div><div class="set-err" id="err-mic"></div></div>
+      <p class="hint">Bars light up when sound reaches the recorder: play something and say a few words to check both.${S.phase === "recording" ? " Changes apply to the next recording." : ""} Bluetooth headsets switch to a lower-quality call mode while their mic is in use.</p>`;
+    $("#set-system").addEventListener("change", saveSettings);
+    $("#set-mic").addEventListener("change", saveSettings);
+  }
+  $("#set-close").addEventListener("click", closeSettings);
+}
+async function saveSettings() {
+  const system = $("#set-system").value, mic_device = $("#set-mic").value;
+  try { S.caps = await recorder({action: "settings", system, mic_device}); }
+  catch (e) { const el = $("#err-system"); if (el) el.textContent = e.message; return; }
+  resetMeter("m-system"); resetMeter("m-mic");
+  renderSettings(); renderCard();
+  meterLoop(); // restart on the new devices
+}
+
 function micIcon() { return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>`; }
 
 function renderCard() {
@@ -563,9 +716,9 @@ function renderCard() {
   const ph = S.phase;
   let right = "", sub = "", extra = "";
   if (ph === "recording") {
-    right = `<span class="timer"><span class="dot recording"></span><span id="timer">${fmtTime(S.rec.seconds)}</span></span><button class="btn danger" id="stop-btn">Stop</button>`;
-    sub = `Recording ${S.rec.mic ? "system audio + microphone" : "system audio"}. Transcript updates every few seconds.`;
-    extra = `<div class="live" id="live">${S.lastLive ? "<b>Live:</b> " + esc(S.lastLive) : "Listening…"}</div>`;
+    right = `${meterHTML("card-meter")}<span class="timer"><span class="dot recording"></span><span id="timer">${fmtTime(S.rec.seconds)}</span></span><button class="btn danger" id="stop-btn">Stop</button>`;
+    sub = `Recording ${esc(deviceLabel(S.rec.monitor) || "system audio")}${S.rec.mic ? " + " + esc(deviceLabel(S.rec.mic_device) || "mic") + " mic" : ""}. Transcript updates every few seconds.`;
+    extra = `<div class="live" id="live">${S.lastLive ? "<b>Live:</b> " + esc(S.lastLive) : "Listening…"}</div><div class="warn" id="quiet" hidden></div>`;
   } else if (ph === "finishing") {
     right = `<span class="hint">Stopping…</span>`; sub = "Wrapping up the recording.";
   } else if (ph === "transcribing" || ph === "summarizing") {
@@ -580,13 +733,16 @@ function renderCard() {
     sub = "This meeting was recording when the page was closed.";
   } else {
     const has = S.cur.duration_s > 0;
-    right = `<label class="chk"><input type="checkbox" id="mic-chk" ${caps.mic ? "checked" : "disabled"} /> Microphone</label><button class="btn primary" id="rec-btn">${has ? "Record more" : "Record"}</button>`;
-    sub = has ? `${fmtDur(S.cur.duration_s)} recorded${S.cur.transcript.final ? ", transcribed with speakers" : ""}.` : `Captures what plays through ${esc((caps.sink || "the default output").replace(/^alsa_output\./, ""))}${caps.mic ? " and your microphone" : ""}.`;
+    right = `<button class="btn primary" id="rec-btn">${has ? "Record more" : "Record"}</button>`;
+    const devs = `${esc(caps.monitor_label || "system audio")}${caps.mic ? " + " + esc(caps.mic_label) + " mic" : ", no mic"}`;
+    sub = (has ? `${fmtDur(S.cur.duration_s)} recorded${S.cur.transcript.final ? ", transcribed with speakers" : ""}. Next take: ${devs}.` : `Captures ${devs}.`) + ` <button class="link" id="dev-link">Change</button>`;
   }
   el.innerHTML = `<div class="card-row"><div class="lead"><div class="ico">${micIcon()}</div><div class="txt"><b>AI meeting notes</b><span>${sub}</span></div></div>${right}</div>${extra}${S.rec.error ? `<div class="warn">${esc(S.rec.error)}</div>` : ""}`;
   const r = $("#rec-btn"); if (r) r.addEventListener("click", startRecording);
   const s = $("#stop-btn"); if (s) s.addEventListener("click", stopRecording);
   const f = $("#finish-btn"); if (f) f.addEventListener("click", finishStale);
+  const d = $("#dev-link"); if (d) d.addEventListener("click", e => { e.stopPropagation(); openSettings(); });
+  renderQuiet();
   renderProgress();
 }
 function renderTimer() { const t = $("#timer"); if (t) t.textContent = fmtTime(S.rec.seconds); else if (S.phase === "idle") renderCard(); }
