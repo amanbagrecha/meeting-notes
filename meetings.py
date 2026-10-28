@@ -57,12 +57,46 @@ def _new(title):
     }
 
 
+_HEADING = re.compile(r"^#{1,6}\s+(.*)")
+_TASK = re.compile(r"^\s*[-*]\s+\[( |x|X)\]\s+")
+
+
+def _excerpt(markdown, limit=220):
+    """First prose under the '## Summary' heading (else the first non-heading
+    text), bullets flattened, cut to `limit` chars for the home-page card."""
+    lines = (markdown or "").split("\n")
+    picked, in_summary, found = [], False, False
+    for raw in lines:
+        l = raw.strip()
+        h = _HEADING.match(l)
+        if h:
+            if found:
+                break
+            in_summary = "summary" in h.group(1).lower()
+            continue
+        if not l:
+            continue
+        if in_summary or not found:
+            picked.append(re.sub(r"^\s*(?:[-*\u2022]|\d+[.)])\s+(?:\[[ xX]\]\s+)?", "", l))
+            found = True
+            if not in_summary:
+                break
+    text = " ".join(picked).strip()
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0] + "\u2026"
+
+
 def _row(m):
-    seg = m.get("transcript", {}).get("segments", [])
+    tr = m.get("transcript", {})
+    seg = tr.get("segments", [])
+    md = (m.get("summary") or {}).get("markdown", "")
+    tasks = [t.group(1) for t in (_TASK.match(l) for l in md.split("\n")) if t]
     return {
         "id": m["id"], "title": m["title"], "created_at": m["created_at"],
         "duration_s": m.get("duration_s", 0), "status": m.get("status"),
         "has_summary": bool(m.get("summary")), "segments": len(seg),
+        "speakers": len(tr.get("speakers", [])),
+        "excerpt": _excerpt(md),
+        "tasks": len(tasks), "open_tasks": sum(1 for t in tasks if t == " "),
     }
 
 

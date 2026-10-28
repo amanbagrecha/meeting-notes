@@ -12,7 +12,7 @@ through `fused.ai` (local Whisper + local llama.cpp), not from these files.
 ## meetings.py
 Lists, creates, reads, patches or deletes meeting records. Writes `.fused/data/meetings/<id>/meeting.json`.
 - Args: `action` (str, default "list": one of list | create | get | update | delete), `meeting_id` (str, required for get/update/delete), `title` (str, default "", used by create), `patch` (str, JSON object, used by update; keys: title, notes, transcript, summary, speaker_names, duration_s, status, format)
-- Returns: list → `[{id, title, created_at, duration_s, status, has_summary, segments}]`; create/get/update → the full meeting object; delete → `{"ok": true, "id": str}`
+- Returns: list → `[{id, title, created_at, duration_s, status, has_summary, segments, speakers, excerpt, tasks, open_tasks}]` (`excerpt` = first prose of the summary, ≤ 220 chars; `tasks`/`open_tasks` count the summary's checkboxes); create/get/update → the full meeting object; delete → `{"ok": true, "id": str}`
 - Example: `{"action":"py","app":"meeting-notes","file":"meetings.py","args":{"action":"get","meeting_id":"20261028-171500-ab12cd"}}`
 
 ## recorder.py
