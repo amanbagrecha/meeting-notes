@@ -10,12 +10,12 @@
   :root {
     color-scheme: dark;
     --bg: var(--fused-bg, #191919);
-    --panel: var(--fused-bg-elevated, #202020);
+    --panel: var(--fused-bg-panel, #202020);
     --text: var(--fused-fg, #e6e6e6);
     --muted: var(--fused-fg-muted, #9b9b9b);
     --line: var(--fused-border, #313131);
     --accent: var(--fused-accent, #4f8cff);
-    --accent-fg: #fff;
+    --accent-fg: var(--fused-on-accent, #fff);
     --hover: rgba(255,255,255,0.06);
     --rec: #e5484d;
     --ok: #30a46c;
@@ -24,7 +24,7 @@
   :root[data-theme="light"] {
     color-scheme: light;
     --bg: var(--fused-bg, #ffffff);
-    --panel: var(--fused-bg-elevated, #f7f7f5);
+    --panel: var(--fused-bg-panel, #f7f7f5);
     --text: var(--fused-fg, #37352f);
     --muted: var(--fused-fg-muted, #787774);
     --line: var(--fused-border, #e9e9e7);

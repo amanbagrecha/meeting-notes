@@ -95,12 +95,17 @@ def _devices():
     return rows
 
 
+def _size(path):
+    return os.path.getsize(path) if os.path.exists(path) else 0
+
+
 def _status(meeting_id):
     folder = _folder(meeting_id)
     rec = _read_json(os.path.join(folder, "rec.json"), {})
     pcm = os.path.join(folder, "audio.pcm")
     wav = os.path.join(folder, "audio.wav")
-    size = os.path.getsize(pcm) if os.path.exists(pcm) else 0
+    # Earlier takes live in audio.pcm; the take in progress in audio.part.pcm.
+    size = _size(pcm) + _size(os.path.join(folder, "audio.part.pcm"))
     running = bool(rec) and rec.get("state") == "recording" and _alive(rec.get("pid"))
     err = None
     if rec and rec.get("state") == "recording" and not running:
@@ -137,7 +142,11 @@ def _start(meeting_id, mic):
     st = _status(meeting_id)
     if st["running"]:
         return st
-    pcm = os.path.join(folder, "audio.pcm")
+    # Each take records into its own part file and is appended to audio.pcm at
+    # stop, so "Record more" on a finished meeting extends it instead of
+    # overwriting it (ffmpeg cannot append).
+    part = os.path.join(folder, "audio.part.pcm")
+    _absorb_part(folder)
     use_mic = bool(mic and caps.get("mic"))
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
            "-f", "pulse", "-i", caps["monitor"]]
@@ -146,7 +155,10 @@ def _start(meeting_id, mic):
                 "-filter_complex",
                 f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,aresample={RATE}[a]",
                 "-map", "[a]"]
-    cmd += ["-ac", "1", "-ar", str(RATE), "-f", "s16le", "-c:a", "pcm_s16le", "-y", pcm]
+    # -flush_packets 1: write every packet straight to disk so status/slice see
+    # audio within ~100 ms instead of in 256 KiB (8 s) bursts.
+    cmd += ["-ac", "1", "-ar", str(RATE), "-f", "s16le", "-c:a", "pcm_s16le",
+            "-flush_packets", "1", "-y", part]
     log = open(os.path.join(folder, "ffmpeg.log"), "ab")
     proc = subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=log, close_fds=True)
@@ -162,6 +174,17 @@ def _start(meeting_id, mic):
         _write_json(os.path.join(folder, "rec.json"), rec)
         raise RuntimeError(st["error"] or "ffmpeg failed to start")
     return st
+
+
+def _absorb_part(folder):
+    """Append a finished take (audio.part.pcm) onto audio.pcm."""
+    part = os.path.join(folder, "audio.part.pcm")
+    if not os.path.exists(part):
+        return
+    pcm = os.path.join(folder, "audio.pcm")
+    with open(part, "rb") as src, open(pcm, "ab") as dst:
+        shutil.copyfileobj(src, dst)
+    os.remove(part)
 
 
 def _stop(meeting_id):
@@ -189,6 +212,7 @@ def _stop(meeting_id):
     cur = _read_json(CURRENT, {})
     if cur.get("meeting_id") == meeting_id:
         _write_json(CURRENT, {})
+    _absorb_part(folder)
     pcm = os.path.join(folder, "audio.pcm")
     wav = os.path.join(folder, "audio.wav")
     if os.path.exists(pcm) and os.path.getsize(pcm) > 0:
@@ -198,10 +222,30 @@ def _stop(meeting_id):
     return _status(meeting_id)
 
 
+def _read_span(paths, start, n):
+    """Read `n` bytes at `start` from the virtual concatenation of `paths`."""
+    out = bytearray()
+    pos = 0
+    for p in paths:
+        size = _size(p)
+        if size == 0:
+            continue
+        lo, hi = max(start, pos), min(start + n, pos + size)
+        if hi > lo:
+            with open(p, "rb") as f:
+                f.seek(lo - pos)
+                out += f.read(hi - lo)
+        pos += size
+        if pos >= start + n:
+            break
+    return bytes(out)
+
+
 def _slice(meeting_id, frm, to):
     folder = _folder(meeting_id)
     pcm = os.path.join(folder, "audio.pcm")
-    size = os.path.getsize(pcm) if os.path.exists(pcm) else 0
+    part = os.path.join(folder, "audio.part.pcm")
+    size = _size(pcm) + _size(part)
     avail = size / BYTES_PER_SEC
     to = min(to, avail) if to > 0 else avail
     frm = max(0.0, min(frm, to))
@@ -214,9 +258,7 @@ def _slice(meeting_id, frm, to):
         tmp = out + ".tmp.wav"
         start_b = int(frm * BYTES_PER_SEC) & ~1
         n = int((to - frm) * BYTES_PER_SEC) & ~1
-        with open(pcm, "rb") as f:
-            f.seek(start_b)
-            data = f.read(n)
+        data = _read_span([pcm, part], start_b, n)
         subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                         "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", "pipe:0",
                         "-c:a", "pcm_s16le", "-y", tmp], input=data, check=True, timeout=30)
