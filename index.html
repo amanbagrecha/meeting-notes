@@ -196,6 +196,27 @@
     .home-head { flex-direction: column; }
   }
 
+  /* ---- calendar: "meeting started" prompt + upcoming list ---- */
+  .calbar:empty { display: none; }
+  .calbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; border: 1px solid var(--accent); border-radius: 10px; padding: 10px 14px; margin-bottom: 20px; background: var(--panel); }
+  .calbar .txt { flex: 1; min-width: 0; }
+  .calbar .txt b { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .calbar .txt span { color: var(--muted); font-size: 12.5px; }
+  .calbar .acts { display: flex; gap: 6px; }
+  .upnext:empty { display: none; }
+  .upnext { margin-bottom: 26px; }
+  .upnext h2 { font-size: 12px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: 0.06em; margin: 0 0 8px; }
+  .ev { display: flex; align-items: center; gap: 12px; padding: 8px 2px; }
+  .ev + .ev { border-top: 1px solid var(--line); }
+  .ev .when { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; width: 110px; flex: none; }
+  .ev .when.now { color: var(--rec); font-weight: 600; }
+  .ev .what { flex: 1; min-width: 0; }
+  .ev .what b { font-weight: 500; display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ev .what span { color: var(--muted); font-size: 12.5px; }
+  .cal-connect { color: var(--muted); font-size: 13px; margin: -8px 0 22px; }
+  .set-sec { border-top: 1px solid var(--line); padding-top: 12px; margin-top: 4px; }
+  .set-sec input[type=text] { width: 100%; border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 5px 8px; font-size: 12.5px; }
+  .set-sec .set-line { margin-top: 8px; }
   .center { height: 100%; display: grid; place-items: center; text-align: center; color: var(--muted); padding: 40px; }
   .center h2 { color: var(--text); font-size: 20px; margin: 0 0 6px; }
   .center p { margin: 0 0 18px; max-width: 420px; }
@@ -236,7 +257,7 @@
   <div class="scrim" id="scrim"></div>
 </div>
 <button class="menu-btn" id="menu-btn" title="Meetings" aria-label="Open meeting list" aria-expanded="false" aria-controls="list"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M4 7h16M4 12h16M4 17h16"/></svg></button>
-<button class="fab" id="settings-btn" title="Audio settings" aria-label="Audio settings" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg></button>
+<button class="fab" id="settings-btn" title="Audio and calendar settings" aria-label="Settings" hidden><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 21v-7M4 10V3M12 21v-9M12 8V3M20 21v-5M20 12V3M1 14h6M9 8h6M17 16h6"/></svg></button>
 <div class="settings" id="settings" hidden></div>
 
 <script>
@@ -261,6 +282,8 @@ function isPreview() {
 // its own key.
 const store = (params, key = "store") => fused.runPython("./meetings.py", params, {key});
 const recorder = (params, key = "ctl") => fused.runPython("./recorder.py", params, {key});
+const calendar = params => fused.runPython("./gcal.py", params, {key: "cal"});
+const CAL_CONFIG = ".fused/data/calendar.json";
 
 // ---------- state ----------
 const S = {
@@ -270,6 +293,8 @@ const S = {
   progress: null,         // {done, total, label}
   liveOffset: 0, liveBusy: false, liveTimer: null, pollTimer: null, lastLive: "",
   search: "", notesTimer: null, summaryError: null,
+  cal: null,              // gcal.py "upcoming" reply: {configured, events, error, fetched_at}
+  autoStart: null,        // meeting id to start recording as soon as it opens
 };
 let seq = 0; // bumps on every meeting switch so stale async work bails
 
@@ -286,6 +311,9 @@ async function boot() {
   S.caps = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
   fused.ai.models.catalog().then(c => { S.catalog = c; }).catch(() => {});
   await onParams();
+  refreshCalendar();
+  setInterval(refreshCalendar, 60 * 1000);
+  document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshCalendar(); });
 }
 
 // Narrow-layout drawer (see the 900px media query). A no-op when the sidebar
@@ -339,6 +367,7 @@ async function openMeeting(id) {
     }
   }
   render();
+  if (S.autoStart === id) { S.autoStart = null; if (m.status === "new" && S.phase === "idle") startRecording(); }
 }
 
 function lastSegmentEnd(m) { const s = m.transcript.segments; return s.length ? s[s.length - 1].end : 0; }
@@ -599,7 +628,8 @@ async function generateSummary() {
   if (!lines.length) { S.summaryError = "Nothing to summarise yet — record a meeting first."; renderTab(); return; }
   S.phase = "summarizing"; S.summaryError = null; S.progress = {done: 0, total: null, label: "Writing summary…"}; render();
   const sys = "You are a meeting-notes assistant. You write concise, factual notes from a transcript. Never invent facts; if the transcript does not cover a section, write 'None noted.' under it. Output Markdown only, no preamble.";
-  const notes = (m.notes || "").trim();
+  const people = m.calendar && m.calendar.attendees && m.calendar.attendees.length ? m.calendar.attendees : null;
+  const notes = ((people ? "Invited: " + people.join(", ") + "\n" : "") + (m.notes || "")).trim();
   try {
     const chunks = chunkLines(lines);
     let model, markdown;
@@ -648,16 +678,18 @@ function renderMain() {
     const id = fused.params.get("meeting");
     if (id) { main.innerHTML = `<div class="center"><p>Loading…</p></div>`; return; }
     if (S.list.length) { renderHome(); return; }
-    main.innerHTML = `<div class="center"><div><h2>AI meeting notes, fully local</h2><p>Record what your computer plays (and your mic), get a live transcript with speakers, and an AI summary. Nothing leaves this machine.</p><button class="btn primary" id="empty-new">New meeting</button></div></div>`;
+    main.innerHTML = `<div class="center"><div><h2>AI meeting notes, fully local</h2><p>Record what your computer plays (and your mic), get a live transcript with speakers, and an AI summary. Nothing leaves this machine.</p><button class="btn primary" id="empty-new">New meeting</button><div class="calbar" id="calbar" style="margin-top:24px;text-align:left"></div></div></div>`;
     $("#empty-new").addEventListener("click", newMeeting);
+    renderCalendar();
     return;
   }
   const tab = currentTab();
   main.innerHTML = `<div class="page">
+    <div class="calbar" id="calbar"></div>
     <h1 class="title" id="title" contenteditable="true" spellcheck="false">${esc(m.title)}</h1>
     <div class="meta"><span>${esc(fmtDate(m.created_at))}</span><span class="sep"></span><span id="meta-dur">${m.duration_s ? fmtDur(m.duration_s) : "Not recorded"}</span>
       ${m.transcript.final ? `<span class="sep"></span><span>${m.transcript.speakers.length} speaker${m.transcript.speakers.length === 1 ? "" : "s"} detected</span>` : ""}
-      <span class="sep"></span><label class="people" title="How many people talk in this meeting. Speaker detection uses it as the exact count; leave empty to guess.">People in call <input id="people" type="number" min="1" max="100" step="1" placeholder="auto" value="${m.expected_speakers || ""}" /></label>
+      <span class="sep"></span><label class="people" title="How many people talk in this meeting. Speaker detection uses it as the exact count; leave empty to guess.">People in call <input id="people" type="number" min="1" max="100" step="1" placeholder="auto" value="${m.expected_speakers || ""}" />${m.calendar && m.expected_speakers && m.expected_speakers === m.calendar.people ? `<span class="hint" title="Speaker detection splits the audio into exactly this many voices. If some invitees stayed quiet, lower it before detecting speakers.">from invite: lower it if some stayed quiet</span>` : ""}</label>
       <span class="grow" style="flex:1"></span><button class="btn ghost small" id="copy-btn">Copy as Markdown</button><button class="btn ghost small" id="del-btn">Delete</button></div>
     <div class="card" id="card"></div>
     <div class="tabs">${["notes","summary","transcript"].map(t => `<button class="tab ${tab === t ? "active" : ""}" data-tab="${t}">${t[0].toUpperCase() + t.slice(1)}</button>`).join("")}</div>
@@ -669,7 +701,7 @@ function renderMain() {
   $("#copy-btn").addEventListener("click", copyMarkdown);
   $("#del-btn").addEventListener("click", deleteCur);
   main.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => fused.params.set("tab", b.dataset.tab)));
-  renderCard(); renderTab();
+  renderCard(); renderTab(); renderCalendar();
 }
 
 // ---------- home ----------
@@ -709,11 +741,118 @@ function renderHome() {
   };
   main.innerHTML = `<div class="page home">
     <div class="home-head"><div><h1>Meeting notes</h1><p class="hint">${esc(stats)}</p></div><button class="btn primary" id="home-new">New meeting</button></div>
+    <div class="calbar" id="calbar"></div><div class="upnext" id="upnext"></div>
     <div class="toolbar"><input class="search" id="home-q" placeholder="Search meetings" value="${esc(S.search)}" /></div>
     ${groups.length ? groups.map(g => `<div class="day"><h2>${esc(g.label)}</h2>${g.rows.map(card).join("")}</div>`).join("") : `<div class="placeholder">No meetings match.</div>`}</div>`;
   $("#home-new").addEventListener("click", newMeeting);
   $("#home-q").addEventListener("input", e => { S.search = e.target.value; renderHome(); const i = $("#home-q"); i.focus(); i.setSelectionRange(i.value.length, i.value.length); });
   main.querySelectorAll(".mcard").forEach(b => b.addEventListener("click", () => fused.params.set("meeting", b.dataset.id)));
+  renderCalendar();
+}
+
+// ---------- calendar ----------
+// gcal.py reads the Google Calendar secret iCal feed (cached, refetched every
+// 5 min). Here: poll it every minute, prompt to record when an event with other
+// people is under way, list what's coming up, and carry the attendee count into
+// the meeting so speaker detection gets an exact number.
+const calKey = ev => `${ev.uid}@${Math.floor(ev.start)}`;
+const dismissed = new Set(JSON.parse(sessionStorage.getItem("cal-dismissed") || "[]"));
+let calBusy = false;
+async function refreshCalendar(refresh = false) {
+  if (calBusy) return;
+  calBusy = true;
+  try { S.cal = await calendar({action: "upcoming", hours_back: "3", hours_ahead: "16", refresh: String(!!refresh)}); }
+  catch (e) { S.cal = {configured: true, events: [], error: e.message}; }
+  finally { calBusy = false; }
+  renderCalendar(); renderSettings();
+}
+function isMeetingEvent(ev) { return (ev.people || 0) >= 2 || !!ev.link; }
+function linkedKeys() { const k = new Set(S.list.map(r => r.calendar_key).filter(Boolean)); if (S.cur && S.cur.calendar) k.add(calKey(S.cur.calendar)); return k; }
+// The event to prompt for: started (or starts within 5 min), not over, has
+// other people, no meeting recorded for it yet, not dismissed this session.
+function liveEvent() {
+  if (!S.cal || !S.cal.events) return null;
+  const now = Date.now() / 1000, linked = linkedKeys();
+  const live = S.cal.events.filter(ev => ev.start - 300 <= now && now < ev.end && isMeetingEvent(ev) && !linked.has(calKey(ev)) && !dismissed.has(calKey(ev)));
+  return live.sort((a, b) => b.start - a.start)[0] || null;
+}
+function evWhen(ev) {
+  const now = Date.now() / 1000, t = d => new Date(d * 1000).toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit"});
+  if (ev.start <= now && now < ev.end) { const m = Math.round((now - ev.start) / 60); return m < 1 ? "started just now" : `started ${m} min ago`; }
+  if (ev.start > now && ev.start - now < 3600) return `in ${Math.max(1, Math.round((ev.start - now) / 60))} min`;
+  return `${t(ev.start)} – ${t(ev.end)}`;
+}
+const peopleText = ev => ev.people ? `${ev.people} ${ev.people === 1 ? "person" : "people"}` : "";
+function calendarPatch(ev, m) {
+  const patch = {calendar: {uid: ev.uid, start: ev.start, end: ev.end, title: ev.title, people: ev.people, attendees: ev.attendees.filter(a => a.status !== "declined").map(a => a.name)}};
+  if (ev.people && !(m && m.expected_speakers)) patch.expected_speakers = ev.people;
+  if (!m || !m.title || /^Meeting \w{3} \d{1,2}, \d{4} \d{2}:\d{2}$/.test(m.title)) patch.title = ev.title;
+  return patch;
+}
+async function recordEvent(ev) {
+  const m = await store({action: "create", title: ev.title});
+  await store({action: "update", meeting_id: m.id, patch: JSON.stringify(calendarPatch(ev, m))});
+  await refreshList();
+  S.autoStart = m.id;
+  fused.params.set("tab", "transcript");
+  fused.params.set("meeting", m.id);
+}
+async function linkEvent(ev, start) {
+  if (!S.cur) return;
+  await saveCur(calendarPatch(ev, S.cur));
+  const row = S.list.find(r => r.id === S.cur.id); if (row) row.calendar_key = calKey(ev);
+  if (start) await startRecording();
+  render();
+}
+function renderCalendar() {
+  const bar = $("#calbar");
+  if (bar) {
+    const ev = liveEvent();
+    if (!ev) bar.innerHTML = "";
+    else {
+      const busy = S.phase !== "idle";
+      const blank = S.cur && S.cur.status === "new" && !S.cur.duration_s && !S.cur.calendar;
+      const act = S.cur && !S.cur.calendar && busy ? ["link", "Link to this meeting"] : blank ? ["here", "Record"] : ["new", "Start recording"];
+      const sub = [evWhen(ev), peopleText(ev), S.cur && !S.cur.calendar && busy ? "sets the title and people count" : ""].filter(Boolean).join(" · ");
+      bar.innerHTML = `<div class="txt"><b>${esc(ev.title)}</b><span>${esc(sub)}</span></div><div class="acts"><button class="btn ghost small" id="cal-dismiss">Dismiss</button><button class="btn primary" id="cal-go" ${busy && act[0] !== "link" ? "disabled" : ""}>${act[1]}</button></div>`;
+      $("#cal-dismiss").addEventListener("click", () => { dismissed.add(calKey(ev)); sessionStorage.setItem("cal-dismissed", JSON.stringify([...dismissed])); renderCalendar(); });
+      $("#cal-go").addEventListener("click", e => { e.target.disabled = true; act[0] === "new" ? recordEvent(ev) : linkEvent(ev, act[0] === "here"); });
+    }
+  }
+  const up = $("#upnext");
+  if (up) {
+    if (!S.cal) { up.innerHTML = ""; return; }
+    if (!S.cal.configured) { up.innerHTML = `<p class="cal-connect">Connect Google Calendar to get a prompt to record when a meeting starts, with the number of people filled in. <button class="link" id="cal-connect">Connect</button></p>`; $("#cal-connect").addEventListener("click", e => { e.stopPropagation(); openSettings(); }); return; }
+    const now = Date.now() / 1000, linked = linkedKeys(), endOfDay = new Date(); endOfDay.setHours(23, 59, 59, 999);
+    const evs = S.cal.events.filter(ev => ev.end > now && ev.start < endOfDay.getTime() / 1000 && isMeetingEvent(ev) && !linked.has(calKey(ev)));
+    if (!evs.length) { up.innerHTML = S.cal.error ? `<p class="cal-connect">Calendar unavailable: ${esc(S.cal.error)}</p>` : ""; return; }
+    up.innerHTML = `<h2>Coming up today</h2>` + evs.map((ev, i) => {
+      const live = ev.start <= now;
+      return `<div class="ev"><span class="when ${live ? "now" : ""}">${esc(live ? "Now" : evWhen(ev))}</span><div class="what"><b>${esc(ev.title)}</b><span>${esc([peopleText(ev), live ? evWhen(ev) : ""].filter(Boolean).join(" · "))}</span></div>${ev.start - now < 600 ? `<button class="btn small" data-ev="${i}" ${S.phase !== "idle" ? "disabled" : ""}>Record</button>` : ""}</div>`;
+    }).join("");
+    up.querySelectorAll("[data-ev]").forEach(b => b.addEventListener("click", () => { b.disabled = true; recordEvent(evs[Number(b.dataset.ev)]); }));
+  }
+}
+function calSettingsHTML() {
+  const c = S.cal;
+  const state = !c ? "Checking…" : !c.configured ? "Not connected." : c.error ? "Error: " + c.error : c.fetched_at ? `Connected · ${c.events.length} event${c.events.length === 1 ? "" : "s"} in the next hours · synced ${new Date(c.fetched_at * 1000).toLocaleTimeString(undefined, {hour: "2-digit", minute: "2-digit"})}` : "Connected.";
+  return `<div class="set-sec"><div class="set-row"><label for="cal-url">Google Calendar <span>· prompts to record, fills in people count</span></label>
+    ${c && c.configured ? `<div class="set-line"><span class="hint" style="flex:1">${esc(state)}</span><button class="btn small" id="cal-sync">Sync</button><button class="btn small" id="cal-off">Disconnect</button></div>`
+    : `<input type="text" id="cal-url" placeholder="https://calendar.google.com/calendar/ical/…/private-…/basic.ics" autocomplete="off" spellcheck="false" />
+      <div class="set-line"><span class="hint" style="flex:1">Google Calendar → Settings → your calendar → Integrate calendar → <i>Secret address in iCal format</i>. Stored on this machine only.</span><button class="btn small primary" id="cal-save">Connect</button></div>`}
+    <div class="set-err" id="err-cal"></div></div></div>`;
+}
+function wireCalSettings() {
+  const save = $("#cal-save"), off = $("#cal-off"), sync = $("#cal-sync");
+  if (save) save.addEventListener("click", async () => {
+    const url = $("#cal-url").value.trim();
+    if (!/^(https|webcal):\/\//.test(url)) { $("#err-cal").textContent = "Paste the full address, starting with https://"; return; }
+    save.disabled = true;
+    try { await fused.writeFile(CAL_CONFIG, JSON.stringify({ics_url: url})); } catch (e) { $("#err-cal").textContent = e.message; save.disabled = false; return; }
+    await refreshCalendar(true);
+  });
+  if (off) off.addEventListener("click", async () => { await fused.writeFile(CAL_CONFIG, "{}").catch(() => {}); await refreshCalendar(); });
+  if (sync) sync.addEventListener("click", () => { sync.disabled = true; refreshCalendar(true); });
 }
 
 // ---------- level meters ----------
@@ -804,7 +943,7 @@ async function meterLoop() {
 }
 function renderSettings() {
   const el = $("#settings"); if (!el || el.hidden) return;
-  const head = `<div class="set-head"><b>Audio input</b><button class="btn ghost small" id="set-close">Close</button></div>`;
+  const head = `<div class="set-head"><b>Settings</b><button class="btn ghost small" id="set-close">Close</button></div>`;
   const c = S.caps;
   if (!c || !c.available) {
     el.innerHTML = head + `<p class="hint">${esc(c ? c.reason : "Checking devices…")}</p>`;
@@ -824,6 +963,8 @@ function renderSettings() {
     $("#set-system").addEventListener("change", saveSettings);
     $("#set-mic").addEventListener("change", saveSettings);
   }
+  el.insertAdjacentHTML("beforeend", calSettingsHTML());
+  wireCalSettings();
   $("#set-close").addEventListener("click", closeSettings);
 }
 async function saveSettings() {
