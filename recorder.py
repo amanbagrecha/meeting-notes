@@ -3,20 +3,25 @@
 Every call is a fresh process (fused-render runs `main` in a subprocess and
 kills it at 60 s), so the capture itself is a *detached* ffmpeg that outlives
 the call. State lives in `.fused/data/meetings/<id>/rec.json`; the raw audio
-is appended to `audio.pcm` (16 kHz, mono, s16le) so a growing file can be
-sliced at any time without caring about a WAV header, and `stop` wraps it
-into `audio.wav` for the final transcription.
+is appended to `audio.pcm` (16 kHz, s16le, interleaved) so a growing file can
+be sliced at any time without caring about a WAV header. A meeting is stereo
+(L = microphone, R = system audio) or, when recorded without a mic or before
+stereo existed, mono; `rec.json` keeps that as `channels`, fixed by the first
+take. `stop` wraps the audio into `audio.wav` (mono mix for playback and
+transcription) plus, for stereo, `audio.mic.wav` and `audio.system.wav`.
 """
 
 import array
 import json
 import math
+import operator
 import os
 import shutil
 import signal
 import subprocess
-import time
 import re
+import time
+import wave
 
 APP = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(APP, ".fused", "data")
@@ -26,9 +31,12 @@ CURRENT = os.path.join(DATA, "recording.json")
 SETTINGS = os.path.join(DATA, "settings.json")
 
 RATE = 16000
-BYTES_PER_SEC = RATE * 2  # mono s16le
-WINDOW = RATE // 20 * 2   # 50 ms of s16le: one level-meter bar
+WIN = RATE // 20  # frames in 50 ms: one level-meter bar
 FLOOR_DB = -90.0
+CHANNELS = ("mix", "mic", "system")
+# Mono downmix of an interleaved L = mic, R = system stream.
+FILTERS = {"mix": "pan=mono|c0=c0+c1,alimiter=limit=0.95:level=0",
+           "mic": "pan=mono|c0=c0", "system": "pan=mono|c0=c1"}
 
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -138,14 +146,44 @@ def _capabilities():
             "settings": st, "devices": devices}
 
 
-def _levels(data):
-    """dBFS of each 50 ms window of s16le `data`."""
-    out = []
-    for i in range(0, len(data) - WINDOW + 1, WINDOW):
-        a = array.array("h", data[i:i + WINDOW])
-        rms = math.sqrt(sum(x * x for x in a) / len(a)) if len(a) else 0
-        out.append(round(max(FLOOR_DB, 20 * math.log10(rms / 32768)) if rms > 0 else FLOOR_DB, 1))
-    return out
+def _samples(data, channels=1):
+    """Whole frames of interleaved s16le `data` as an array of samples."""
+    a = array.array("h")
+    frame = 2 * channels
+    a.frombytes(data[:len(data) // frame * frame])
+    return a
+
+
+def _db(a):
+    rms = math.sqrt(sum(map(operator.mul, a, a)) / len(a)) if len(a) else 0
+    return round(max(FLOOR_DB, 20 * math.log10(rms / 32768)) if rms > 0 else FLOOR_DB, 1)
+
+
+def _window_levels(a):
+    """dBFS of each 50 ms window of mono samples `a`."""
+    return [_db(a[i:i + WIN]) for i in range(0, len(a) - WIN + 1, WIN)]
+
+
+def _channel_levels(data, channels=1):
+    """Per-channel dBFS of each 50 ms window of interleaved s16le `data`."""
+    a = _samples(data, channels)
+    return [_window_levels(a[c::channels]) for c in range(channels)]
+
+
+def _levels(data, channels=1):
+    """dBFS of each 50 ms window of s16le `data`: the loudest channel."""
+    return [max(w) for w in zip(*_channel_levels(data, channels))]
+
+
+def _mono(a, channels, channel):
+    """One channel of interleaved samples `a`; "mix" is the clipped sum."""
+    if channels == 1:
+        return a
+    if channel == "mic":
+        return a[0::2]
+    if channel == "system":
+        return a[1::2]
+    return array.array("h", (max(-32768, min(32767, l + r)) for l, r in zip(a[0::2], a[1::2])))
 
 
 def _meter(devices, secs):
@@ -166,7 +204,7 @@ def _meter(devices, secs):
         except subprocess.TimeoutExpired:
             p.kill()
             data, err = p.communicate()
-        out[key] = {"device": devices[key], "levels": _levels(data[-int(secs * BYTES_PER_SEC):] if data else b""),
+        out[key] = {"device": devices[key], "levels": _levels(data[-int(secs * RATE * 2):] if data else b""),
                     "error": (err or b"").decode(errors="replace").strip()[-200:] or None if p.returncode else None}
     return out
 
@@ -182,6 +220,9 @@ def _status(meeting_id):
     wav = os.path.join(folder, "audio.wav")
     # Earlier takes live in audio.pcm; the take in progress in audio.part.pcm.
     size = _size(pcm) + _size(os.path.join(folder, "audio.part.pcm"))
+    channels = rec.get("channels", 1)
+    frame = 2 * channels
+    bps = RATE * frame
     running = bool(rec) and rec.get("state") == "recording" and _alive(rec.get("pid"))
     err = None
     if rec and rec.get("state") == "recording" and not running:
@@ -193,28 +234,40 @@ def _status(meeting_id):
         except OSError:
             err = "recorder exited unexpectedly"
     levels = []
+    per = []
     if running:
         # The last second of the take in progress, for the page's level meter.
         part = os.path.join(folder, "audio.part.pcm")
-        n = _size(part)
-        span = min(n, BYTES_PER_SEC) // WINDOW * WINDOW
+        n = _size(part) // frame * frame
+        span = min(n, bps) // (WIN * frame) * (WIN * frame)
         if span:
             with open(part, "rb") as f:
-                f.seek((n - span) & ~1)
-                levels = _levels(f.read(span))
-    return {
+                f.seek(n - span)
+                data = f.read(span)
+            per = _channel_levels(data, channels)
+            levels = [max(w) for w in zip(*per)]
+    out = {
         "meeting_id": meeting_id,
         "running": running,
+        "channels": channels,
         "levels": levels,
-        "seconds": size / BYTES_PER_SEC,
+        "seconds": size / bps,
         "bytes": size,
         "mic": rec.get("mic", False),
         "monitor": rec.get("monitor"),
         "mic_device": rec.get("mic_device"),
         "started_at": rec.get("started_at"),
         "wav": wav if os.path.exists(wav) else None,
+        "wav_mic": None,
+        "wav_system": None,
         "error": err,
     }
+    if channels == 2:
+        out["levels_mic"], out["levels_system"] = per if per else ([], [])
+        for key, name in (("wav_mic", "audio.mic.wav"), ("wav_system", "audio.system.wav")):
+            p = os.path.join(folder, name)
+            out[key] = p if os.path.exists(p) else None
+    return out
 
 
 def _start(meeting_id, mic):
@@ -237,22 +290,35 @@ def _start(meeting_id, mic):
     part = os.path.join(folder, "audio.part.pcm")
     _absorb_part(folder)
     use_mic = bool(mic and caps.get("mic"))
+    # The first take fixes the layout: stereo (L mic, R system) if it has a mic.
+    if _size(os.path.join(folder, "audio.pcm")):
+        channels = _read_json(os.path.join(folder, "rec.json"), {}).get("channels", 1)
+    else:
+        channels = 2 if use_mic else 1
+    mono = f"aresample={RATE},aformat=channel_layouts=mono"
     cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "warning",
            "-f", "pulse", "-i", caps["monitor"]]
-    if use_mic:
+    if use_mic and channels == 2:
+        cmd += ["-f", "pulse", "-i", caps["mic"], "-filter_complex",
+                f"[0:a]{mono}[sys];[1:a]{mono}[mic];"
+                "[mic][sys]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[a]",
+                "-map", "[a]"]
+    elif use_mic:
         cmd += ["-f", "pulse", "-i", caps["mic"],
                 "-filter_complex",
                 f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,aresample={RATE}[a]",
                 "-map", "[a]"]
+    elif channels == 2:  # no mic this take: keep the left channel silent so takes line up
+        cmd += ["-filter_complex", f"[0:a]{mono},pan=stereo|c0=0*c0|c1=c0[a]", "-map", "[a]"]
     # -flush_packets 1: write every packet straight to disk so status/slice see
     # audio within ~100 ms instead of in 256 KiB (8 s) bursts.
-    cmd += ["-ac", "1", "-ar", str(RATE), "-f", "s16le", "-c:a", "pcm_s16le",
+    cmd += ["-ac", str(channels), "-ar", str(RATE), "-f", "s16le", "-c:a", "pcm_s16le",
             "-flush_packets", "1", "-y", part]
     log = open(os.path.join(folder, "ffmpeg.log"), "ab")
     proc = subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=log, close_fds=True)
     rec = {"pid": proc.pid, "state": "recording", "started_at": time.time(),
-           "mic": use_mic, "monitor": caps["monitor"], "mic_device": caps["mic"] if use_mic else None}
+           "channels": channels, "mic": use_mic, "monitor": caps["monitor"], "mic_device": caps["mic"] if use_mic else None}
     _write_json(os.path.join(folder, "rec.json"), rec)
     _write_json(CURRENT, {"meeting_id": meeting_id, "pid": proc.pid})
     # Give ffmpeg a moment to fail fast on a bad device.
@@ -304,10 +370,20 @@ def _stop(meeting_id):
     _absorb_part(folder)
     pcm = os.path.join(folder, "audio.pcm")
     wav = os.path.join(folder, "audio.wav")
-    if os.path.exists(pcm) and os.path.getsize(pcm) > 0:
-        subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                        "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", pcm,
-                        "-c:a", "pcm_s16le", "-y", wav], check=True, timeout=50)
+    if _size(pcm) > 0:
+        channels = rec.get("channels", 1)
+        cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+               "-f", "s16le", "-ar", str(RATE), "-ac", str(channels), "-i", pcm]
+        if channels == 2:
+            cmd += ["-filter_complex",
+                    f"[0:a]asplit=3[a][b][c];[a]{FILTERS['mix']}[mix];"
+                    f"[b]{FILTERS['mic']}[mic];[c]{FILTERS['system']}[sys]",
+                    "-map", "[mix]", "-c:a", "pcm_s16le", "-y", wav,
+                    "-map", "[mic]", "-c:a", "pcm_s16le", "-y", os.path.join(folder, "audio.mic.wav"),
+                    "-map", "[sys]", "-c:a", "pcm_s16le", "-y", os.path.join(folder, "audio.system.wav")]
+        else:
+            cmd += ["-c:a", "pcm_s16le", "-y", wav]
+        subprocess.run(cmd, check=True, timeout=50)
     return _status(meeting_id)
 
 
@@ -330,27 +406,59 @@ def _read_span(paths, start, n):
     return bytes(out)
 
 
-def _slice(meeting_id, frm, to):
+def _write_wav(path, data):
+    with wave.open(path, "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        w.writeframes(data)
+
+
+def _slice(meeting_id, frm, to, channel="mix", snap=0.0):
+    if channel not in CHANNELS:
+        raise ValueError(f"channel must be one of {', '.join(CHANNELS)}")
     folder = _folder(meeting_id)
     pcm = os.path.join(folder, "audio.pcm")
     part = os.path.join(folder, "audio.part.pcm")
-    size = _size(pcm) + _size(part)
-    avail = size / BYTES_PER_SEC
+    channels = _read_json(os.path.join(folder, "rec.json"), {}).get("channels", 1)
+    if channels == 1:
+        channel = "mix"
+    frame = 2 * channels
+    avail = (_size(pcm) + _size(part)) // frame / RATE
     to = min(to, avail) if to > 0 else avail
     frm = max(0.0, min(frm, to))
     if to - frm < 0.5:
-        return {"path": None, "from": frm, "to": to, "seconds": 0}
+        return {"path": None, "from": frm, "to": to, "seconds": 0, "channel": channel,
+                "peak_db": None, "quiet_db": None}
+    quiet = None
+    lo = max(to - snap, frm + 0.5) if snap > 0 else to
+    if lo < to:
+        # Cut at the quietest 50 ms of the mix just before `to`: a pause, not a word.
+        first = int(lo * RATE)
+        raw = _read_span([pcm, part], first * frame, (int(to * RATE) - first) * frame)
+        lv = _window_levels(_mono(_samples(raw, channels), channels, "mix"))
+        if lv:
+            i = min(reversed(range(len(lv))), key=lv.__getitem__)
+            quiet = lv[i]
+            to = lo + (i + 0.5) * WIN / RATE
     out_dir = os.path.join(CACHE, "slices")
     os.makedirs(out_dir, exist_ok=True)
-    out = os.path.join(out_dir, f"{meeting_id}-{int(frm * 1000)}-{int(to * 1000)}.wav")
-    if not os.path.exists(out):
+    out = os.path.join(out_dir, f"{meeting_id}-{channel}-{int(frm * 1000)}-{int(to * 1000)}.wav")
+    first = int(frm * RATE)
+    if os.path.exists(out):
+        with wave.open(out, "rb") as w:
+            mono = _samples(w.readframes(w.getnframes()))
+    else:
+        data = _read_span([pcm, part], first * frame, (int(to * RATE) - first) * frame)
+        if channels == 2:
+            data = subprocess.run(
+                ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
+                 "-f", "s16le", "-ar", str(RATE), "-ac", "2", "-i", "pipe:0",
+                 "-af", FILTERS[channel], "-f", "s16le", "-ac", "1", "pipe:1"],
+                input=data, check=True, timeout=30, stdout=subprocess.PIPE).stdout
+        mono = _samples(data)
         tmp = out + ".tmp.wav"
-        start_b = int(frm * BYTES_PER_SEC) & ~1
-        n = int((to - frm) * BYTES_PER_SEC) & ~1
-        data = _read_span([pcm, part], start_b, n)
-        subprocess.run(["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
-                        "-f", "s16le", "-ar", str(RATE), "-ac", "1", "-i", "pipe:0",
-                        "-c:a", "pcm_s16le", "-y", tmp], input=data, check=True, timeout=30)
+        _write_wav(tmp, mono.tobytes())
         os.replace(tmp, out)
     # Keep the slice cache small: drop slices older than an hour.
     now = time.time()
@@ -361,12 +469,13 @@ def _slice(meeting_id, frm, to):
                 os.remove(p)
         except OSError:
             pass
-    return {"path": out, "from": frm, "to": to, "seconds": to - frm}
+    return {"path": out, "from": frm, "to": to, "seconds": to - frm, "channel": channel,
+            "peak_db": max(_window_levels(mono), default=FLOOR_DB), "quiet_db": quiet}
 
 
 def main(action: str = "status", meeting_id: str = "", mic: bool = True,
          frm: float = 0.0, to: float = 0.0, system: str = "", mic_device: str = "",
-         secs: float = 0.5):
+         secs: float = 0.5, channel: str = "mix", snap: float = 0.0):
     if action == "capabilities":
         caps = _capabilities()
         cur = _read_json(CURRENT, {})
@@ -388,5 +497,5 @@ def main(action: str = "status", meeting_id: str = "", mic: bool = True,
     if action == "stop":
         return _stop(meeting_id)
     if action == "slice":
-        return _slice(meeting_id, float(frm), float(to))
+        return _slice(meeting_id, float(frm), float(to), channel, float(snap))
     raise ValueError(f"unknown action {action!r}")
