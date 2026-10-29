@@ -8,9 +8,9 @@ summary with action items when it ends. Every model runs on this machine.
 
 | Need | What exists | Decision |
 |---|---|---|
-| System audio capture | Linux + PipeWire. `fused.capture.audio({source:"system"})` is refused on Linux; `fused.capture.screen({audio:"system"})` needs a browser share picker and records video too. `ffmpeg -f pulse` on the default sink's `.monitor` and the mic works and survives a `runPython` return when started detached (verified). | **Native PipeWire capture via ffmpeg**, spawned detached by `recorder.py`. Mixes system audio + mic into one 16 kHz mono WAV. Mic is optional. |
-| Transcription | fused-render's local `faster-whisper` runner (CTranslate2, CPU). `faster-whisper-small` and `large-v3-turbo` already downloaded. | **`fused.ai.transcribe`**, small model for live chunks, large-v3-turbo for the final pass. |
-| Speaker detection | `diarize: true` on transcribe runs sherpa-onnx pyannote segmentation + speaker embeddings (already downloaded). | **Diarize on the final pass**; labels `Speaker 1..N`, user can rename. Live chunks are not diarized (too short). |
+| System audio capture | Linux + PipeWire. `fused.capture.audio({source:"system"})` is refused on Linux; `fused.capture.screen({audio:"system"})` needs a browser share picker and records video too. `ffmpeg -f pulse` on the default sink's `.monitor` and the mic works and survives a `runPython` return when started detached (verified). | **Native PipeWire capture via ffmpeg**, spawned detached by `recorder.py`. Records 16 kHz stereo, mic left and system right, so "Me" is known for free; `stop` also writes a mono mix for the player. Mic is optional; meetings recorded before this stay mono. |
+| Transcription | fused-render's local `faster-whisper` runner (CTranslate2, CPU). `faster-whisper-small` and `large-v3-turbo` already downloaded. | **`fused.ai.transcribe`**: whisper small for live chunks (cut at pauses, 1 s overlap, language pinned, last words as prompt); Parakeet TDT v3 for the final pass (whisper large-v3-turbo when the language is outside Parakeet's 25). |
+| Speaker detection | `diarize: true` on transcribe runs sherpa-onnx pyannote segmentation + speaker embeddings (already downloaded). | **Diarize the system channel on the final pass** into people − 1 voices (count asked at stop); the mic channel is "Me", minus lines that echo the call. Without a count, voices with little talk time are folded into their neighbours. Live chunks are not diarized (too short). |
 | Summary | local `llama.cpp` (Vulkan, Radeon RX 9060 XT). `Qwen3.5-4B-Q4_K_M.gguf` downloaded, recommended. Context = 8192 tokens. | **`fused.ai.text` with the catalog's recommended local text model**. Long transcripts are summarised in chunks, then merged. No cloud provider ever. |
 | Storage | `.fused/data/` | One folder per meeting: `audio.wav`, `meeting.json` (title, notes, transcript, summary, speaker names). |
 
@@ -33,7 +33,7 @@ timestamps. Mapped here:
 ## Out of scope (v1)
 
 - Calendar detection of meetings, auto-start.
-- Separate per-speaker tracks ("You" vs remote) — mixed track for now; a later version can keep the mic as its own track to label the user for free.
+- Per-word speaker labels: diarization labels whole segments and the render API returns no turns to split them on.
 - Windows / macOS paths (the recorder is PipeWire-specific; the page shows a clear "needs PipeWire" state elsewhere).
 - Translation, multi-language summaries, export to Notion API.
 
