@@ -74,6 +74,8 @@
   .title:focus { background: var(--hover); }
   .meta { color: var(--muted); font-size: 13px; display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 22px; }
   .meta .sep::before { content: "·"; }
+  .people { display: inline-flex; align-items: center; gap: 6px; }
+  .people input { width: 56px; border: 1px solid var(--line); background: var(--panel); border-radius: 4px; padding: 1px 6px; font-size: 13px; }
 
   .btn { display: inline-flex; align-items: center; gap: 6px; padding: 6px 12px; border-radius: 6px; border: 1px solid var(--line); background: var(--panel); font-weight: 500; white-space: nowrap; }
   .btn:hover { background: var(--hover); }
@@ -505,13 +507,19 @@ async function finalPass() {
   const stale = () => my !== seq || run !== finalRun; // switched meeting or skipped
   for (let attempt = 0; attempt < 3; attempt++) {
     try {
+      const n = S.cur.expected_speakers;
       const r = await fused.ai.transcribe({
         path: S.rec.wav, model: finalModel(), provider: "local", diarize: true,
+        // Known head count: obeyed exactly. Left out, the count is estimated
+        // from the voices, which over-splits on a mixed call recording.
+        ...(Number.isInteger(n) && n >= 1 && n <= 100 ? {speakers: n} : {}),
         onProgress: j => { if (stale()) return; S.progress = {done: j.done || 0, total: j.total || S.rec.seconds || null, label: j.detail || "Transcribing…"}; renderProgress(); },
       });
       if (stale()) return;
       const segs = r.segments.filter(s => s.text.trim()).map(s => ({start: round(s.startSecond), end: round(s.endSecond), text: s.text.trim(), speaker: s.speaker || null}));
       const speakers = (r.speakers && r.speakers.length) ? r.speakers : [...new Set(segs.map(s => s.speaker).filter(Boolean))];
+      // A re-run relabels voices, so names given to the old labels no longer apply.
+      if (S.cur.transcript.final && Object.keys(S.cur.speaker_names || {}).length) await saveCur({speaker_names: {}});
       S.cur.transcript = {segments: segs.length ? segs : live, speakers, final: segs.length > 0, model: r.response && r.response.modelId || null, language: r.language || null};
       await saveCur({transcript: S.cur.transcript, status: "done", duration_s: round(r.durationInSeconds || S.rec.seconds || 0)});
       S.phase = "idle"; S.progress = null; render();
@@ -648,7 +656,8 @@ function renderMain() {
   main.innerHTML = `<div class="page">
     <h1 class="title" id="title" contenteditable="true" spellcheck="false">${esc(m.title)}</h1>
     <div class="meta"><span>${esc(fmtDate(m.created_at))}</span><span class="sep"></span><span id="meta-dur">${m.duration_s ? fmtDur(m.duration_s) : "Not recorded"}</span>
-      ${m.transcript.final ? `<span class="sep"></span><span>${m.transcript.speakers.length} speaker${m.transcript.speakers.length === 1 ? "" : "s"}</span>` : ""}
+      ${m.transcript.final ? `<span class="sep"></span><span>${m.transcript.speakers.length} speaker${m.transcript.speakers.length === 1 ? "" : "s"} detected</span>` : ""}
+      <span class="sep"></span><label class="people" title="How many people talk in this meeting. Speaker detection uses it as the exact count; leave empty to guess.">People in call <input id="people" type="number" min="1" max="100" step="1" placeholder="auto" value="${m.expected_speakers || ""}" /></label>
       <span class="grow" style="flex:1"></span><button class="btn ghost small" id="copy-btn">Copy as Markdown</button><button class="btn ghost small" id="del-btn">Delete</button></div>
     <div class="card" id="card"></div>
     <div class="tabs">${["notes","summary","transcript"].map(t => `<button class="tab ${tab === t ? "active" : ""}" data-tab="${t}">${t[0].toUpperCase() + t.slice(1)}</button>`).join("")}</div>
@@ -656,6 +665,7 @@ function renderMain() {
   const title = $("#title");
   title.addEventListener("blur", () => { const t = title.textContent.trim(); if (t !== m.title) saveCur({title: t}); });
   title.addEventListener("keydown", e => { if (e.key === "Enter") { e.preventDefault(); title.blur(); } });
+  $("#people").addEventListener("change", e => { const v = parseInt(e.target.value, 10); const n = v >= 1 && v <= 100 ? v : null; e.target.value = n || ""; saveCur({expected_speakers: n}); renderTab(); });
   $("#copy-btn").addEventListener("click", copyMarkdown);
   $("#del-btn").addEventListener("click", deleteCur);
   main.querySelectorAll(".tab").forEach(b => b.addEventListener("click", () => fused.params.set("tab", b.dataset.tab)));
@@ -895,7 +905,8 @@ function renderTab() {
     const q = S.search.trim().toLowerCase();
     const shown = q ? segs.filter(s => s.text.toLowerCase().includes(q)) : segs;
     el.innerHTML = `<div class="toolbar"><input class="search" id="q" placeholder="Search transcript" value="${esc(S.search)}" /><span class="grow"></span>
-      ${m.transcript.final ? `<span class="hint">${esc(m.transcript.model || "")}</span>` : (segs.length && S.rec.wav && S.phase === "idle" ? `<button class="btn small" id="rerun-btn">Detect speakers</button>` : "")}</div>
+      ${m.transcript.final ? `<span class="hint">${esc(m.transcript.model || "")}</span>` : ""}
+      ${segs.length && S.rec.wav && S.phase === "idle" ? `<button class="btn small" id="rerun-btn" title="${m.expected_speakers ? `Split the recording into exactly ${m.expected_speakers} voices` : "Set People in call above for a better split"}">${m.transcript.final ? "Re-detect speakers" : "Detect speakers"}${m.expected_speakers ? ` (${m.expected_speakers})` : ""}</button>` : ""}</div>
       ${S.rec.wav && S.phase === "idle" ? `<audio id="audio" controls preload="none" src="${fused.rawUrl(S.rec.wav)}"></audio>` : ""}
       ${m.transcript.speakers.length ? `<div class="legend">${m.transcript.speakers.map(sp => `<span class="chip"><span class="sw" style="background:${colorOf(sp)}"></span><input data-sp="${esc(sp)}" value="${esc(names[sp] || sp)}" title="Click to rename" /></span>`).join("")}</div>` : ""}
       ${shown.length ? groupSegments(shown).map(g => `<div class="seg"><button class="ts" data-t="${g.start}">${fmtTime(g.start)}</button><div>

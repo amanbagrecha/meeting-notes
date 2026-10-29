@@ -14,7 +14,8 @@ MEETINGS = os.path.join(APP, ".fused", "data", "meetings")
 
 _ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # Keys the page may patch. Anything else in `patch` is ignored.
-PATCHABLE = {"title", "notes", "transcript", "summary", "speaker_names", "duration_s", "status", "format"}
+PATCHABLE = {"title", "notes", "transcript", "summary", "speaker_names", "duration_s", "status", "format",
+             "expected_speakers", "calendar"}
 
 
 def _path(meeting_id):
@@ -54,6 +55,8 @@ def _new(title):
         "transcript": {"segments": [], "speakers": [], "final": False, "model": None},
         "speaker_names": {},
         "summary": None,            # {markdown, model, format, created_at}
+        "expected_speakers": None,  # people in the call; passed to diarization as the exact count
+        "calendar": None,           # {uid, start, end, title, attendees: [name]} when started from an event
     }
 
 
@@ -97,7 +100,15 @@ def _row(m):
         "speakers": len(tr.get("speakers", [])),
         "excerpt": _excerpt(md),
         "tasks": len(tasks), "open_tasks": sum(1 for t in tasks if t == " "),
+        "calendar_key": _cal_key(m.get("calendar")),
     }
+
+
+def _cal_key(c):
+    """uid@start: one occurrence of a (possibly recurring) calendar event."""
+    if not isinstance(c, dict) or not c.get("uid"):
+        return None
+    return f"{c['uid']}@{int(c.get('start') or 0)}"
 
 
 def main(action: str = "list", meeting_id: str = "", title: str = "", patch: str = ""):
