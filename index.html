@@ -340,7 +340,7 @@ async function refreshList() {
 
 async function openMeeting(id) {
   const my = ++seq;
-  stopLoops();
+  stopLoops(); if (S.askDone) S.askDone(null);
   S.cur = null; S.phase = "idle"; S.progress = null; S.rec = {running: false, seconds: 0, error: null}; S.lastLive = ""; S.search = ""; S.summaryError = null;
   render();
   if (!id) return;
@@ -359,7 +359,7 @@ async function openMeeting(id) {
   if (m.status === "recording") {
     if (st && st.running) {
       S.rec = st; S.phase = "recording";
-      S.liveOffset = lastSegmentEnd(m);
+      S.liveOffset = lastSegmentEnd(m); S.liveLang = m.transcript.language || null;
       startLoops();
     } else {
       S.rec = st || S.rec; S.phase = "idle";
@@ -409,7 +409,7 @@ async function startRecording() {
   } catch (e) {
     S.phase = "idle"; S.rec.error = e.message; render(); return;
   }
-  S.liveOffset = lastSegmentEnd(S.cur);
+  S.liveOffset = lastSegmentEnd(S.cur); S.liveLang = S.cur.transcript.language || null;
   await saveCur({status: "recording"});
   startLoops();
   render();
@@ -417,7 +417,7 @@ async function startRecording() {
 
 function startLoops() {
   stopLoops();
-  S.lastBytes = S.rec.bytes || 0; S.loudAt = Date.now();
+  S.lastSecs = S.rec.seconds || 0; S.loudAt = Date.now();
   S.pollTimer = setInterval(pollStatus, 750);
   S.liveTimer = setInterval(liveTick, 5000);
 }
@@ -435,8 +435,8 @@ async function pollStatus() {
     if (my !== seq) return;
     S.rec = st;
     // Only the windows recorded since the last poll go to the meter.
-    const fresh = Math.min(st.levels.length, Math.round((st.bytes - S.lastBytes) / 1600));
-    S.lastBytes = st.bytes;
+    const fresh = Math.min(st.levels.length, Math.round((st.seconds - S.lastSecs) * 20));
+    S.lastSecs = st.seconds;
     if (fresh > 0) {
       const lv = st.levels.slice(-fresh);
       feedMeter("card-meter", lv);
@@ -452,24 +452,33 @@ async function pollStatus() {
 }
 
 // Live transcription: every few seconds, transcribe the audio that arrived
-// since the last slice with the small model and append it. Not diarized —
-// the final pass at stop redoes the whole file with speakers.
-const LIVE_MIN = 12; // seconds of new audio before a slice is worth a model call
+// since the last slice and append it. Not diarized — the final pass at stop
+// redoes the whole file with speakers. Slices end in the quietest spot of
+// their last few seconds and start OVERLAP s early so a word cut at the seam
+// is heard whole; only words starting after the seam are kept.
+const LIVE_MIN = 8;     // seconds of new audio before a slice is worth a model call
+const LIVE_SNAP = 3;    // look this far back from the end for a pause to cut at
+const OVERLAP = 1;
+const SILENT_DB = -50;  // a slice whose loudest 50 ms is below this is not transcribed
 async function liveTick(force = false) {
   if (S.liveBusy || !S.cur || (S.phase !== "recording" && !force)) return;
   const avail = S.rec.seconds || 0;
   if (!force && avail - S.liveOffset < LIVE_MIN) return;
   if (avail - S.liveOffset < 0.5) return;
   S.liveBusy = true;
-  const my = seq, id = S.cur.id, from = S.liveOffset, to = avail;
+  const my = seq, id = S.cur.id, seam = S.liveOffset, from = Math.max(0, seam - OVERLAP), to = avail;
   try {
-    const sl = await recorder({action: "slice", meeting_id: id, frm: String(from), to: String(to)}, "slice");
+    const sl = await recorder({action: "slice", meeting_id: id, frm: String(from), to: String(to), snap: String(force ? 0 : LIVE_SNAP)}, "slice");
     if (my !== seq || !sl.path) return;
-    S.liveOffset = sl.to;
-    const r = await fused.ai.transcribe({path: sl.path, model: liveModel(), provider: "local"});
+    if (sl.peak_db != null && sl.peak_db < SILENT_DB) { S.liveOffset = sl.to; return; }
+    const prompt = S.cur.transcript.segments.map(s => s.text).join(" ").slice(-200);
+    const r = await fused.ai.transcribe({path: sl.path, model: liveModel(), provider: "local", words: true,
+      ...(prompt ? {initialPrompt: prompt} : {}), ...(S.liveLang ? {language: S.liveLang} : {})});
     // The final pass may have replaced the transcript while this slice decoded.
     if (my !== seq || !S.cur || S.phase !== "recording") return;
-    const segs = r.segments.filter(s => s.text.trim()).map(s => ({start: round(sl.from + s.startSecond), end: round(sl.from + s.endSecond), text: s.text.trim(), speaker: null}));
+    S.liveOffset = sl.to;
+    if (!S.liveLang && r.language) S.liveLang = r.language;
+    const segs = r.segments.map(s => afterSeam(s, sl.from, seam)).filter(Boolean);
     if (segs.length) {
       S.cur.transcript.segments.push(...segs);
       S.lastLive = segs[segs.length - 1].text;
@@ -483,16 +492,35 @@ async function liveTick(force = false) {
 }
 const round = x => Math.round(x * 100) / 100;
 
+// A slice's segment in meeting time, cut to the words that start at or after
+// `seam` (the overlap before it was already transcribed by the last slice).
+function afterSeam(s, offset, seam) {
+  const words = (s.words || []).filter(w => w.word.trim());
+  if (words.length) {
+    const kept = words.filter(w => offset + w.startSecond >= seam - 0.05);
+    if (!kept.length) return null;
+    return {start: round(offset + kept[0].startSecond), end: round(offset + kept[kept.length - 1].endSecond), text: kept.map(w => w.word).join("").trim(), speaker: null};
+  }
+  if (offset + s.startSecond < seam - 0.3 || !s.text.trim()) return null;
+  return {start: round(offset + s.startSecond), end: round(offset + s.endSecond), text: s.text.trim(), speaker: null};
+}
+
 function asrModels() {
   const row = S.catalog && S.catalog.capabilities.find(c => c.capability === "automatic-speech-recognition");
   return row ? row.models.filter(m => m.downloaded) : [];
 }
-function liveModel() { // fastest downloaded: the live draft is replaced by the final pass anyway
-  const ms = asrModels(); const sm = ms.find(m => /tiny/i.test(m.id)) || ms.find(m => /small/i.test(m.id)) || ms.sort((a, b) => (a.size_gb || 0) - (b.size_gb || 0))[0];
+function liveModel() { // whisper small: tiny is too error-prone even for a draft; whisper takes initialPrompt/language, Parakeet doesn't
+  const ms = asrModels(); const sm = ms.find(m => /whisper-small/i.test(m.id)) || ms.find(m => /whisper/i.test(m.id) && !/large/i.test(m.id)) || ms.sort((a, b) => (a.size_gb || 0) - (b.size_gb || 0))[0];
   return sm ? sm.id : undefined;
 }
-function finalModel() { // recommended, else largest downloaded
-  const ms = asrModels(); const r = ms.find(m => m.recommended) || ms.sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0))[0];
+// Parakeet TDT v3: more accurate than whisper-large-v3-turbo on English and
+// much faster on CPU, but it only knows these languages.
+const PARAKEET_LANGS = new Set("bg hr cs da nl en et fi fr de el hu it lv lt mt pl pt ro sk sl es sv ru uk".split(" "));
+function finalModel(lang) {
+  const ms = asrModels();
+  const pk = ms.find(m => /parakeet/i.test(m.id));
+  if (pk && (!lang || PARAKEET_LANGS.has(lang))) return pk.id;
+  const r = ms.find(m => m.recommended && !/parakeet/i.test(m.id)) || ms.filter(m => !/parakeet/i.test(m.id)).sort((a, b) => (b.size_gb || 0) - (a.size_gb || 0))[0];
   return r ? r.id : undefined;
 }
 function textModel() {
@@ -514,7 +542,7 @@ async function stopRecording() {
   if (my !== seq) return;
   S.rec = st;
   await saveCur({duration_s: round(st.seconds), status: "transcribing"});
-  await finalPass();
+  if (await askPeople()) await finalPass();
 }
 
 async function finishStale() { // recorder died while away: wrap what exists and transcribe
@@ -525,43 +553,149 @@ async function finishStale() { // recorder died while away: wrap what exists and
   catch (e) { S.phase = "idle"; S.rec.error = e.message; render(); return; }
   if (my !== seq) return;
   await saveCur({duration_s: round(S.rec.seconds), status: "transcribing"});
-  await finalPass();
+  if (await askPeople()) await finalPass();
+}
+
+// Speaker detection guesses the head count badly on call audio (one person
+// often comes out as several voices), so ask before the final pass. Carries
+// on by itself after ASK_SECS so a walked-away user still gets a transcript.
+// Resolves false when the user switched meeting meanwhile.
+const ASK_SECS = 45;
+function peopleCount(m) { const n = m && m.expected_speakers; return Number.isInteger(n) && n >= 1 && n <= 100 ? n : null; }
+function askPeople() {
+  if (!S.cur || peopleCount(S.cur) || !S.rec.wav) return Promise.resolve(true);
+  const my = seq;
+  S.phase = "asking"; render();
+  return new Promise(resolve => {
+    const done = async n => {
+      clearTimeout(S.askTimer); S.askDone = null;
+      if (my !== seq) return resolve(false);
+      if (n) await saveCur({expected_speakers: n});
+      S.phase = "idle"; render(); resolve(true);
+    };
+    S.askDone = done;
+    S.askTimer = setTimeout(() => done(null), ASK_SECS * 1000);
+  });
+}
+
+const ME = "Me";
+// A detected voice with under MIN_TALK_SHARE of the talk time is folded into
+// its neighbours; so is one under MIN_TALK_S once there is enough talk for
+// seconds to mean something (an 8 min call can hold only 90 s of speech).
+const MIN_TALK_S = 10, MIN_TALK_SHARE = 0.03, MIN_TALK_TOTAL = 300;
+
+// One transcribe call, waiting out a cold model load. `onChunk` streams the
+// decoded text into the card while the run is in progress.
+async function transcribeOnce(opts, stale, base, total, what) {
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      return await fused.ai.transcribe({...opts, provider: "local", model: finalModel(S.cur.transcript.language || S.liveLang), words: true,
+        onProgress: j => { if (stale()) return; S.progress = {done: base + (j.done || 0), total, label: what + (j.detail ? ": " + j.detail : "…")}; renderProgress(); },
+        onChunk: seg => { if (stale() || !seg.text.trim()) return; S.lastLive = seg.text.trim(); renderLive(); },
+      });
+    } catch (e) {
+      if (!stale() && e && e.type === "model_loading" && e.jobId) { await waitJob(e.jobId, "Loading speech model…"); continue; }
+      throw e;
+    }
+  }
+  throw new Error("the speech model did not load");
+}
+
+// Segments in meeting time, split wherever the words pause for longer than
+// WORD_GAP so a line never spans a long silence.
+const WORD_GAP = 1.5;
+function toSegments(r, speaker) {
+  const out = [];
+  for (const s of r.segments) {
+    if (!s.text.trim()) continue;
+    const sp = speaker !== undefined ? speaker : (s.speaker || null);
+    const w = (s.words || []).filter(x => x.word.trim());
+    if (!w.length) { out.push({start: round(s.startSecond), end: round(s.endSecond), text: s.text.trim(), speaker: sp}); continue; }
+    let run = [w[0]];
+    const flush = () => out.push({start: round(run[0].startSecond), end: round(run[run.length - 1].endSecond), text: run.map(x => x.word).join("").trim(), speaker: sp});
+    for (const x of w.slice(1)) { if (x.startSecond - run[run.length - 1].endSecond > WORD_GAP) { flush(); run = []; } run.push(x); }
+    flush();
+  }
+  return out;
+}
+
+// With the call on speakers, the mic hears the remote side too. A mic line
+// that says mostly the same words as a system line at the same time is echo.
+const tokens = t => t.toLowerCase().match(/[\p{L}\p{N}']+/gu) || [];
+function dropEcho(mic, sys) {
+  let dropped = 0;
+  const kept = mic.filter(m => {
+    const mt = tokens(m.text); if (!mt.length) return false;
+    const near = sys.filter(s => s.start < m.end + 1.5 && s.end > m.start - 1.5);
+    if (!near.length) return true;
+    const st = new Set(near.flatMap(s => tokens(s.text)));
+    const echo = mt.filter(t => st.has(t)).length / mt.length >= 0.6;
+    if (echo) dropped++;
+    return !echo;
+  });
+  return {kept, dropped};
+}
+
+// Auto-counted diarization over-splits: a handful of seconds of one person
+// becomes its own "speaker". Fold every voice with too little talk time (and
+// lines nobody was heard on) into the nearest-in-time remaining voice, then
+// renumber Speaker 1..N in order of first appearance.
+function foldSpeakers(segs, fold) {
+  const remote = segs.filter(s => s.speaker !== ME);
+  const talk = new Map(); let total = 0;
+  for (const s of remote) if (s.speaker) { const d = Math.max(0, s.end - s.start); talk.set(s.speaker, (talk.get(s.speaker) || 0) + d); total += d; }
+  const small = new Set(fold ? [...talk].filter(([, t]) => t < MIN_TALK_SHARE * total || (t < MIN_TALK_S && total >= MIN_TALK_TOTAL)).map(([sp]) => sp) : []);
+  if (small.size < talk.size) {
+    const big = remote.filter(s => s.speaker && !small.has(s.speaker));
+    for (const s of remote) {
+      if (s.speaker && !small.has(s.speaker)) continue;
+        let best = null, gap = Infinity;
+      for (const b of big) { const g = Math.max(0, b.start - s.end, s.start - b.end); if (g < gap) { gap = g; best = b; } }
+      s.speaker = best.speaker;
+    }
+  }
+  const names = new Map();
+  for (const s of segs) if (s.speaker && s.speaker !== ME && !names.has(s.speaker)) names.set(s.speaker, `Speaker ${names.size + 1}`);
+  for (const s of segs) if (s.speaker && s.speaker !== ME) s.speaker = names.get(s.speaker);
+  return [...(segs.some(s => s.speaker === ME) ? [ME] : []), ...names.values()];
 }
 
 async function finalPass() {
   if (!S.cur || !S.rec.wav) { S.phase = "idle"; await saveCur({status: "done"}); render(); return; }
-  const my = seq, id = S.cur.id, run = ++finalRun;
-  S.phase = "transcribing"; S.progress = {done: 0, total: S.rec.seconds || null, label: "Starting…"}; render();
-  const live = S.cur.transcript.segments;
+  const my = seq, run = ++finalRun;
   const stale = () => my !== seq || run !== finalRun; // switched meeting or skipped
-  for (let attempt = 0; attempt < 3; attempt++) {
-    try {
-      const n = S.cur.expected_speakers;
-      const r = await fused.ai.transcribe({
-        path: S.rec.wav, model: finalModel(), provider: "local", diarize: true,
-        // Known head count: obeyed exactly. Left out, the count is estimated
-        // from the voices, which over-splits on a mixed call recording.
-        ...(Number.isInteger(n) && n >= 1 && n <= 100 ? {speakers: n} : {}),
-        onProgress: j => { if (stale()) return; S.progress = {done: j.done || 0, total: j.total || S.rec.seconds || null, label: j.detail || "Transcribing…"}; renderProgress(); },
-      });
+  const live = S.cur.transcript.segments;
+  const n = peopleCount(S.cur), dur = S.rec.seconds || 0;
+  // Stereo meetings: the mic is "Me" and needs no diarizing; the system
+  // channel holds everyone else, so it is split into n - 1 voices.
+  const split = !!(S.rec.wav_mic && S.rec.wav_system);
+  const remoteN = split ? (n && n > 1 ? n - 1 : null) : n;
+  const passes = split ? 2 : 1;
+  S.phase = "transcribing"; S.lastLive = ""; S.progress = {done: 0, total: dur * passes || null, label: "Starting…"}; render();
+  try {
+    const sysR = await transcribeOnce({path: split ? S.rec.wav_system : S.rec.wav, diarize: true, ...(remoteN ? {speakers: remoteN} : {})},
+      stale, 0, dur * passes || null, split ? "Call audio" : "Transcribing");
+    if (stale()) return;
+    let segs = toSegments(sysR), echo = 0;
+    if (split) {
+      const micR = await transcribeOnce({path: S.rec.wav_mic}, stale, dur, dur * 2 || null, "Your mic");
       if (stale()) return;
-      const segs = r.segments.filter(s => s.text.trim()).map(s => ({start: round(s.startSecond), end: round(s.endSecond), text: s.text.trim(), speaker: s.speaker || null}));
-      const speakers = (r.speakers && r.speakers.length) ? r.speakers : [...new Set(segs.map(s => s.speaker).filter(Boolean))];
-      // A re-run relabels voices, so names given to the old labels no longer apply.
-      if (S.cur.transcript.final && Object.keys(S.cur.speaker_names || {}).length) await saveCur({speaker_names: {}});
-      S.cur.transcript = {segments: segs.length ? segs : live, speakers, final: segs.length > 0, model: r.response && r.response.modelId || null, language: r.language || null};
-      await saveCur({transcript: S.cur.transcript, status: "done", duration_s: round(r.durationInSeconds || S.rec.seconds || 0)});
-      S.phase = "idle"; S.progress = null; render();
-      if (segs.length) await generateSummary();
-      return;
-    } catch (e) {
-      if (stale()) return;
-      if (e && e.type === "model_loading" && e.jobId) { await waitJob(e.jobId, "Loading speech model…"); continue; }
-      S.phase = "idle"; S.progress = null; S.rec.error = "Final transcription failed: " + (e.message || e);
-      await saveCur({status: "done"}); render(); return;
+      const {kept, dropped} = dropEcho(toSegments(micR, ME), segs);
+      echo = dropped;
+      segs = segs.concat(kept).sort((a, b) => a.start - b.start);
     }
+    const speakers = foldSpeakers(segs, !remoteN);
+    // A re-run relabels voices, so names given to the old labels no longer apply.
+    if (S.cur.transcript.final && Object.keys(S.cur.speaker_names || {}).length) await saveCur({speaker_names: {}});
+    S.cur.transcript = {segments: segs.length ? segs : live, speakers, final: segs.length > 0, model: sysR.response && sysR.response.modelId || null, language: sysR.language || null, echo};
+    await saveCur({transcript: S.cur.transcript, status: "done", duration_s: round(sysR.durationInSeconds || dur)});
+    S.phase = "idle"; S.progress = null; S.lastLive = ""; render();
+    if (segs.length) await generateSummary();
+  } catch (e) {
+    if (stale()) return;
+    S.phase = "idle"; S.progress = null; S.lastLive = ""; S.rec.error = "Final transcription failed: " + (e.message || e);
+    await saveCur({status: "done"}); render();
   }
-  S.phase = "idle"; S.progress = null; render();
 }
 
 // Keep the live draft (no speaker labels) and go straight to the summary.
@@ -986,7 +1120,10 @@ function renderCard() {
   if (ph === "recording") {
     right = `${meterHTML("card-meter")}<span class="timer"><span class="dot recording"></span><span id="timer">${fmtTime(S.rec.seconds)}</span></span><button class="btn danger" id="stop-btn">Stop</button>`;
     sub = `Recording ${esc(deviceLabel(S.rec.monitor) || "system audio")}${S.rec.mic ? " + " + esc(deviceLabel(S.rec.mic_device) || "mic") + " mic" : ""}. Transcript updates every few seconds.`;
-    extra = `<div class="live" id="live">${S.lastLive ? "<b>Live:</b> " + esc(S.lastLive) : "Listening…"}</div><div class="warn" id="quiet" hidden></div>`;
+    extra = `<div class="live" id="live">${liveHTML()}</div><div class="warn" id="quiet" hidden></div>`;
+  } else if (ph === "asking") {
+    right = `<label class="people">People in call <input id="ask-n" type="number" min="1" max="100" step="1" placeholder="${S.rec.wav_mic ? "you + others" : "count"}" /></label><button class="btn primary" id="ask-go">Continue</button><button class="btn small" id="ask-skip">Let it guess</button>`;
+    sub = `How many people talked, you included? Speakers are split into exactly that many voices; a guess often finds too many. Continues on its own in ${ASK_SECS} s.`;
   } else if (ph === "finishing") {
     right = `<span class="hint">Stopping…</span>`; sub = "Wrapping up the recording.";
   } else if (ph === "transcribing" || ph === "summarizing") {
@@ -994,7 +1131,7 @@ function renderCard() {
     sub = ph === "transcribing"
       ? (S.cur.transcript.segments.length ? "Step 1 of 2: re-reading the whole recording with the large speech model to label who said what and fix live-transcript errors. Then the summary is written." : "Step 1 of 2: transcribing the recording and labelling speakers. Then the summary is written.")
       : "Step 2 of 2: the local language model is writing your notes.";
-    extra = `<div class="progress ${S.progress && S.progress.total ? "" : "indet"}"><div id="prog-bar"></div></div>`;
+    extra = `<div class="progress ${S.progress && S.progress.total ? "" : "indet"}"><div id="prog-bar"></div></div>${ph === "transcribing" ? `<div class="live" id="live">${liveHTML()}</div>` : ""}`;
   } else if (!caps.available) {
     right = `<button class="btn primary" disabled>Record</button>`;
     sub = caps.reason || "Recording unavailable on this machine.";
@@ -1013,11 +1150,22 @@ function renderCard() {
   const f = $("#finish-btn"); if (f) f.addEventListener("click", finishStale);
   const k = $("#skip-btn"); if (k) k.addEventListener("click", skipFinal);
   const d = $("#dev-link"); if (d) d.addEventListener("click", e => { e.stopPropagation(); openSettings(); });
+  const an = $("#ask-n");
+  if (an) {
+    const go = () => { const v = parseInt(an.value, 10); if (S.askDone) S.askDone(v >= 1 && v <= 100 ? v : null); };
+    an.focus(); an.addEventListener("keydown", e => { if (e.key === "Enter") go(); });
+    $("#ask-go").addEventListener("click", go);
+    $("#ask-skip").addEventListener("click", () => { if (S.askDone) S.askDone(null); });
+  }
   renderQuiet();
   renderProgress();
 }
 function renderTimer() { const t = $("#timer"); if (t) t.textContent = fmtTime(S.rec.seconds); else if (S.phase === "idle") renderCard(); }
-function renderLive() { const l = $("#live"); if (l) l.innerHTML = S.lastLive ? "<b>Live:</b> " + esc(S.lastLive) : "Listening…"; }
+function liveHTML() {
+  if (S.phase === "transcribing") return S.lastLive ? "<b>Heard:</b> " + esc(S.lastLive) : "Waiting for the first words…";
+  return S.lastLive ? "<b>Live:</b> " + esc(S.lastLive) : "Listening…";
+}
+function renderLive() { const l = $("#live"); if (l) l.innerHTML = liveHTML(); }
 function renderProgress() {
   const p = S.progress; const bar = $("#prog-bar"), lab = $("#prog-label");
   if (lab && p) lab.textContent = p.label || "";
@@ -1047,7 +1195,8 @@ function renderTab() {
     const shown = q ? segs.filter(s => s.text.toLowerCase().includes(q)) : segs;
     el.innerHTML = `<div class="toolbar"><input class="search" id="q" placeholder="Search transcript" value="${esc(S.search)}" /><span class="grow"></span>
       ${m.transcript.final ? `<span class="hint">${esc(m.transcript.model || "")}</span>` : ""}
-      ${segs.length && S.rec.wav && S.phase === "idle" ? `<button class="btn small" id="rerun-btn" title="${m.expected_speakers ? `Split the recording into exactly ${m.expected_speakers} voices` : "Set People in call above for a better split"}">${m.transcript.final ? "Re-detect speakers" : "Detect speakers"}${m.expected_speakers ? ` (${m.expected_speakers})` : ""}</button>` : ""}</div>
+      ${segs.length && S.rec.wav && S.phase === "idle" ? `<button class="btn small" id="rerun-btn" title="Transcribes the whole recording again, which takes a while on CPU. ${m.expected_speakers ? `Splits it into exactly ${m.expected_speakers} voices.` : "Set People in call above for a better split."}">${m.transcript.final ? "Re-detect speakers" : "Detect speakers"}${m.expected_speakers ? ` (${m.expected_speakers})` : ""}</button>` : ""}</div>
+      ${m.transcript.echo ? `<div class="warn">Left out ${m.transcript.echo} line${m.transcript.echo === 1 ? "" : "s"} your mic picked up from the speakers. Headphones, or PipeWire's echo-cancel module, give a cleaner "${ME}" track.</div>` : ""}
       ${S.rec.wav && S.phase === "idle" ? `<audio id="audio" controls preload="none" src="${fused.rawUrl(S.rec.wav)}"></audio>` : ""}
       ${m.transcript.speakers.length ? `<div class="legend">${m.transcript.speakers.map(sp => `<span class="chip"><span class="sw" style="background:${colorOf(sp)}"></span><input data-sp="${esc(sp)}" value="${esc(names[sp] || sp)}" title="Click to rename" /></span>`).join("")}</div>` : ""}
       ${shown.length ? groupSegments(shown).map(g => `<div class="seg"><button class="ts" data-t="${g.start}">${fmtTime(g.start)}</button><div>
