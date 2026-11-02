@@ -308,7 +308,7 @@ async function boot() {
   initSettings();
   fused.params.onChange(onParams);
   await refreshList();
-  S.caps = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
+  S.caps = await loadCaps();
   fused.ai.models.catalog().then(c => { S.catalog = c; }).catch(() => {});
   await onParams();
   refreshCalendar();
@@ -355,6 +355,8 @@ async function openMeeting(id) {
   // detached, so closing the tab never stops it).
   const st = await recorder({action: "status", meeting_id: id}, "status").catch(() => null);
   if (my !== seq) return;
+  if (st && st.backend === "capture" && st.running && !(await captureLive(st))) st.running = false;
+  if (my !== seq) return;
   if (st) { S.rec = st; S.rec.error = null; }
   if (m.status === "recording") {
     if (st && st.running) {
@@ -392,6 +394,7 @@ async function saveCur(patch) {
 async function deleteCur() {
   if (!S.cur) return;
   if (!confirm(`Delete "${S.cur.title}" and its recording?`)) return;
+  if (S.phase === "recording" && S.rec.backend === "capture") await stopCaptures(S.rec.captures, true);
   if (S.phase === "recording") await recorder({action: "stop", meeting_id: S.cur.id}).catch(() => {});
   stopLoops();
   await store({action: "delete", meeting_id: S.cur.id});
@@ -401,11 +404,79 @@ async function deleteCur() {
 }
 
 // ---------- recording ----------
+// Linux: recorder.py runs a detached ffmpeg on PipeWire. macOS ("capture"
+// backend): no PipeWire, so this page records each take with fused.capture --
+// the system output and the default mic as two files -- and recorder.py
+// decodes them into the same mic-left / system-right layout at stop.
+const viaCapture = () => !!(S.caps && S.caps.backend === "capture");
+const MAX_REC_S = 4 * 60 * 60; // fused.capture's ceiling; its 30 min default would cut meetings short
+
+async function loadCaps() {
+  const c = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
+  if (c.backend !== "capture") return c;
+  try {
+    const src = await fused.capture.sources();
+    const sys = src.systemAudio || {}, mic = src.audio || {};
+    if (!sys.available) { c.available = false; c.reason = sys.reason || "This Mac cannot record system audio."; }
+    if (c.mic && !mic.available) { c.mic = null; c.mic_label = null; }
+    const def = (src.microphones || []).find(m => m.default);
+    if (c.mic && def) c.mic_label = def.name;
+  } catch (e) { c.available = false; c.reason = e.message; }
+  return c;
+}
+
+async function startCapture() {
+  const id = S.cur.id, title = S.cur.title || "Meeting";
+  const plan = await recorder({action: "begin", meeting_id: id});
+  const ids = {}; let warn = null;
+  try {
+    ids.system = (await fused.capture.audio({source: "system", path: plan.system, maxSeconds: MAX_REC_S, title: `${title} · call audio`})).id;
+    if (plan.mic) {
+      try { ids.mic = (await fused.capture.audio({source: "mic", path: plan.mic, maxSeconds: MAX_REC_S, title: `${title} · your mic`})).id; }
+      catch (e) { warn = "Your mic is not being recorded: " + (e.message || e); }
+    }
+  } catch (e) {
+    await stopCaptures(ids, true);
+    await recorder({action: "stop", meeting_id: id}).catch(() => {});
+    throw e;
+  }
+  const st = await recorder({action: "captures", meeting_id: id, ids: JSON.stringify(ids)});
+  st.error = warn;
+  return st;
+}
+
+// Is the take's system-audio recording still running? (The floating pill's
+// stop, or hitting maxSeconds, ends it without this page.)
+async function captureLive(st) {
+  const id = st.captures && st.captures.system;
+  if (!id) return false;
+  const live = await fused.capture.list().catch(() => null);
+  return live ? live.some(r => r.id === id) : true;
+}
+
+// Stop (or cancel = stop and delete) the take's recordings; returns a warning
+// worth showing, e.g. that the system-audio tap heard only silence.
+async function stopCaptures(ids, cancel = false) {
+  const warns = [];
+  for (const [k, cid] of Object.entries(ids || {})) {
+    if (!cid) continue;
+    try {
+      const h = await fused.capture.attach(cid);
+      const r = await (cancel ? h.cancel() : h.stop());
+      if (r && r.warning && k === "system") warns.push(r.warning);
+    } catch (e) {
+      // bad_request = already finished (pill stop): its file is complete.
+      if (e && e.type === "capture_error") warns.push(`${k === "mic" ? "Mic" : "Call audio"} recording failed: ${e.message}`);
+    }
+  }
+  return warns.join(" ") || null;
+}
+
 async function startRecording() {
   if (!S.cur || S.phase !== "idle") return;
   S.rec.error = null; S.phase = "recording"; render();
   try {
-    S.rec = await recorder({action: "start", meeting_id: S.cur.id});
+    S.rec = viaCapture() ? await startCapture() : await recorder({action: "start", meeting_id: S.cur.id});
   } catch (e) {
     S.phase = "idle"; S.rec.error = e.message; render(); return;
   }
@@ -433,6 +504,11 @@ async function pollStatus() {
   try {
     const st = await recorder({action: "status", meeting_id: S.cur.id}, "status");
     if (my !== seq) return;
+    if (st.backend === "capture") {
+      st.error = S.rec.error; // keep a mic warning from the start
+      if (!(await captureLive(st))) { polling = false; stopRecording(); return; }
+      if (my !== seq) return;
+    }
     S.rec = st;
     // Only the windows recorded since the last poll go to the meter.
     const fresh = Math.min(st.levels.length, Math.round((st.seconds - S.lastSecs) * 20));
@@ -443,7 +519,7 @@ async function pollStatus() {
       if (lv.some(db => db > QUIET_DB)) S.loudAt = Date.now();
     }
     renderQuiet();
-    if (!st.running) { // died on its own
+    if (!st.running && st.backend !== "capture") { // died on its own
       stopLoops(); S.phase = "idle"; S.rec.error = st.error || "The recorder stopped unexpectedly.";
     }
     renderTimer();
@@ -462,6 +538,7 @@ const OVERLAP = 1;
 const SILENT_DB = -50;  // a slice whose loudest 50 ms is below this is not transcribed
 async function liveTick(force = false) {
   if (S.liveBusy || !S.cur || (S.phase !== "recording" && !force)) return;
+  if (S.rec.backend === "capture") return; // an .m4a is unreadable until stopped: no live slices
   const avail = S.rec.seconds || 0;
   if (!force && avail - S.liveOffset < LIVE_MIN) return;
   if (avail - S.liveOffset < 0.5) return;
@@ -536,11 +613,12 @@ async function stopRecording() {
   stopLoops();
   S.phase = "finishing"; render();
   const id = S.cur.id, my = seq;
+  const warn = S.rec.backend === "capture" ? await stopCaptures(S.rec.captures) : null;
   let st;
   try { st = await recorder({action: "stop", meeting_id: id}); }
   catch (e) { S.phase = "idle"; S.rec.error = e.message; render(); return; }
   if (my !== seq) return;
-  S.rec = st;
+  S.rec = st; S.rec.error = warn;
   await saveCur({duration_s: round(st.seconds), status: "transcribing"});
   if (await askPeople()) await finalPass();
 }
@@ -549,6 +627,7 @@ async function finishStale() { // recorder died while away: wrap what exists and
   if (!S.cur) return;
   S.phase = "finishing"; S.rec.error = null; render();
   const my = seq;
+  if (S.rec.backend === "capture") await stopCaptures(S.rec.captures);
   try { S.rec = await recorder({action: "stop", meeting_id: S.cur.id}); }
   catch (e) { S.phase = "idle"; S.rec.error = e.message; render(); return; }
   if (my !== seq) return;
@@ -1021,7 +1100,7 @@ setInterval(() => {
 
 function renderQuiet() {
   const q = $("#quiet"); if (!q) return;
-  const silent = S.phase === "recording" && Date.now() - (S.loudAt || Date.now()) > 10000;
+  const silent = S.phase === "recording" && S.rec.backend !== "capture" && Date.now() - (S.loudAt || Date.now()) > 10000;
   q.hidden = !silent;
   if (silent) q.innerHTML = `No sound has reached the recorder for ${Math.round((Date.now() - S.loudAt) / 1000)}s. Check the devices in <button class="link" id="quiet-link">audio settings</button>.`;
   const l = $("#quiet-link"); if (l) l.addEventListener("click", e => { e.stopPropagation(); openSettings(); });
@@ -1050,7 +1129,7 @@ async function openSettings() {
   panel.hidden = false; $("#settings-btn").classList.add("open");
   renderSettings();
   // Re-read devices: a headset may have connected since the page loaded.
-  S.caps = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
+  S.caps = await loadCaps();
   if (panel.hidden) return;
   renderSettings(); renderCard();
   meterLoop();
@@ -1061,7 +1140,7 @@ function closeSettings() {
 }
 async function meterLoop() {
   const my = ++meterRun;
-  while (my === meterRun && S.caps && S.caps.available) {
+  while (my === meterRun && S.caps && S.caps.available && !viaCapture()) {
     try {
       const r = await recorder({action: "meter", secs: "0.8"}, "meter");
       if (my !== meterRun) return;
@@ -1081,6 +1160,16 @@ function renderSettings() {
   const c = S.caps;
   if (!c || !c.available) {
     el.innerHTML = head + `<p class="hint">${esc(c ? c.reason : "Checking devices…")}</p>`;
+  } else if (c.backend === "capture") {
+    const off = (c.settings || {}).mic === "off";
+    const name = c.mic_label && c.mic_label !== "default input" ? c.mic_label : "system default";
+    el.innerHTML = head + `
+      <div class="set-row"><label>System audio <span>· what others say</span></label>
+        <p class="hint">Everything this Mac plays.</p></div>
+      <div class="set-row"><label for="set-mic">Microphone <span>· what you say</span></label>
+        <div class="set-line"><select class="sel" id="set-mic"><option value=""${off ? "" : " selected"}>Default input (${esc(name)})</option><option value="off"${off ? " selected" : ""}>Off: don't record my mic</option></select></div><div class="set-err" id="err-mic"></div></div>
+      <p class="hint">macOS records its current input; pick another in System Settings › Sound. The first recording asks for Microphone and System Audio Recording access. A floating pill with a level meter shows while recording.${S.phase === "recording" ? " Changes apply to the next recording." : ""}</p>`;
+    $("#set-mic").addEventListener("change", saveSettings);
   } else {
     const devs = c.devices || [], st = c.settings || {system: "", mic: ""};
     const opt = (v, text, sel) => `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(text)}</option>`;
@@ -1102,9 +1191,9 @@ function renderSettings() {
   $("#set-close").addEventListener("click", closeSettings);
 }
 async function saveSettings() {
-  const system = $("#set-system").value, mic_device = $("#set-mic").value;
-  try { S.caps = await recorder({action: "settings", system, mic_device}); }
-  catch (e) { const el = $("#err-system"); if (el) el.textContent = e.message; return; }
+  const sysEl = $("#set-system"), system = sysEl ? sysEl.value : "", mic_device = $("#set-mic").value;
+  try { await recorder({action: "settings", system, mic_device}); S.caps = await loadCaps(); }
+  catch (e) { const el = $("#err-system") || $("#err-mic"); if (el) el.textContent = e.message; return; }
   resetMeter("m-system"); resetMeter("m-mic");
   renderSettings(); renderCard();
   meterLoop(); // restart on the new devices
@@ -1118,9 +1207,12 @@ function renderCard() {
   const ph = S.phase;
   let right = "", sub = "", extra = "";
   if (ph === "recording") {
-    right = `${meterHTML("card-meter")}<span class="timer"><span class="dot recording"></span><span id="timer">${fmtTime(S.rec.seconds)}</span></span><button class="btn danger" id="stop-btn">Stop</button>`;
-    sub = `Recording ${esc(deviceLabel(S.rec.monitor) || "system audio")}${S.rec.mic ? " + " + esc(deviceLabel(S.rec.mic_device) || "mic") + " mic" : ""}. Transcript updates every few seconds.`;
-    extra = `<div class="live" id="live">${liveHTML()}</div><div class="warn" id="quiet" hidden></div>`;
+    const cap = S.rec.backend === "capture";
+    right = `${cap ? "" : meterHTML("card-meter")}<span class="timer"><span class="dot recording"></span><span id="timer">${fmtTime(S.rec.seconds)}</span></span><button class="btn danger" id="stop-btn">Stop</button>`;
+    sub = cap
+      ? `Recording Mac audio${S.rec.mic ? " + " + esc((S.caps && S.caps.mic_label) || "your") + " mic" : ""}. The transcript is written when you stop.`
+      : `Recording ${esc(deviceLabel(S.rec.monitor) || "system audio")}${S.rec.mic ? " + " + esc(deviceLabel(S.rec.mic_device) || "mic") + " mic" : ""}. Transcript updates every few seconds.`;
+    extra = cap ? "" : `<div class="live" id="live">${liveHTML()}</div><div class="warn" id="quiet" hidden></div>`;
   } else if (ph === "asking") {
     right = `<label class="people">People in call <input id="ask-n" type="number" min="1" max="100" step="1" placeholder="${S.rec.wav_mic ? "you + others" : "count"}" /></label><button class="btn primary" id="ask-go">Continue</button><button class="btn small" id="ask-skip">Let it guess</button>`;
     sub = `How many people talked, you included? Speakers are split into exactly that many voices; a guess often finds too many. Continues on its own in ${ASK_SECS} s.`;
