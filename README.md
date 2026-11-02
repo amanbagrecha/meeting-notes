@@ -14,10 +14,10 @@ A local-only meeting recorder for fused-render, modelled on Notion's AI Meeting 
 ## Files
 
 - `index.html` — the whole UI; talks to Python through `fused.runPython` and to local models through `fused.ai`.
-- `recorder.py` — spawns a detached `ffmpeg` on PipeWire (default sink monitor + mic), mixed to 16 kHz mono, and slices the growing audio for live transcription.
+- `recorder.py` — on Linux spawns a detached `ffmpeg` on PipeWire (default sink monitor + mic) and slices the growing audio for live transcription; on macOS decodes the page's `fused.capture` takes (system audio + mic) with `afconvert` into the same mic/system split.
 - `meetings.py` — stores each meeting under `.fused/data/meetings/<id>/` (`audio.wav`, `meeting.json`).
 - `SCOPE.md` — design notes and the decisions behind the above.
 
 ## Requirements
 
-Linux with PipeWire and `ffmpeg` on PATH, and fused-render's local transcription and text models downloaded (Whisper via faster-whisper, a llama.cpp text model). No network is used at runtime.
+Linux with PipeWire and `ffmpeg` on PATH, or macOS 13+ (recorded through fused-render's `fused.capture`: grant Microphone and System Audio Recording on first use; the transcript is written at stop rather than live), and fused-render's local transcription and text models downloaded (Whisper via faster-whisper, a llama.cpp text model). No network is used at runtime.

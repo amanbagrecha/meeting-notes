@@ -34,7 +34,7 @@ timestamps. Mapped here:
 
 - Calendar detection of meetings, auto-start.
 - Per-word speaker labels: diarization labels whole segments and the render API returns no turns to split them on.
-- Windows / macOS paths (the recorder is PipeWire-specific; the page shows a clear "needs PipeWire" state elsewhere).
+- Windows. (macOS was added 2026-11-02: the page records system audio and the default mic as two `fused.capture.audio` files, `recorder.py` decodes them with `afconvert` into the stereo mic/system layout at stop. An .m4a is unreadable until finalised, so macOS gets no live transcript, only the final pass; the mic can't be chosen per app, only in System Settings.)
 - Translation, multi-language summaries, export to Notion API.
 
 ## Files
