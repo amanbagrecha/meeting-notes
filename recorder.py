@@ -1,4 +1,5 @@
-"""System-audio + microphone recorder on PipeWire, driven by ffmpeg.
+"""System-audio + microphone recorder: PipeWire + ffmpeg on Linux, the page's
+`fused.capture` on macOS.
 
 Every call is a fresh process (fused-render runs `main` in a subprocess and
 kills it at 60 s), so the capture itself is a *detached* ffmpeg that outlives
@@ -9,10 +10,19 @@ be sliced at any time without caring about a WAV header. A meeting is stereo
 stereo existed, mono; `rec.json` keeps that as `channels`, fixed by the first
 take. `stop` wraps the audio into `audio.wav` (mono mix for playback and
 transcription) plus, for stereo, `audio.mic.wav` and `audio.system.wav`.
+
+macOS ("capture" backend): there is no PipeWire monitor, so the PAGE records
+each take with `fused.capture.audio` -- one recording of the system output
+(`take.system.m4a`) and one of the default microphone (`take.mic.m4a`) -- and
+`stop` decodes both with the built-in `afconvert` into the same `audio.pcm`
+layout. An .m4a cannot be read until it is finalised, so there is no live
+slice on macOS: the transcript is written at stop.
 """
 
 import array
 import json
+import sys
+import warnings
 import math
 import operator
 import os
@@ -23,6 +33,14 @@ import re
 import time
 import wave
 
+with warnings.catch_warnings():
+    warnings.simplefilter("ignore", DeprecationWarning)
+    try:
+        import audioop  # stdlib through 3.12; C-speed mixing of PCM
+    except ImportError:  # 3.13+
+        audioop = None
+
+MAC = sys.platform == "darwin"
 APP = os.path.dirname(os.path.abspath(__file__))
 DATA = os.path.join(APP, ".fused", "data")
 CACHE = os.path.join(APP, ".fused", "cache")
@@ -72,10 +90,12 @@ def _alive(pid):
         return False
     except PermissionError:
         return True
-    # A zombie still answers kill(0); check /proc state.
+    # A zombie still answers kill(0); check /proc state (Linux only).
     try:
         with open(f"/proc/{pid}/stat") as f:
             return f.read().split(")")[-1].split()[0] != "Z"
+    except FileNotFoundError:
+        return not os.path.isdir("/proc")
     except OSError:
         return False
 
@@ -121,6 +141,15 @@ def _capabilities():
     A saved device that has gone away (headset unplugged) falls back to the
     default rather than failing the recording.
     """
+    if MAC:
+        # The page records through fused.capture and refines this with
+        # fused.capture.sources() (permissions, the default mic's name).
+        if not shutil.which("afconvert"):
+            return {"available": False, "reason": "needs afconvert (ships with macOS) on PATH"}
+        st = _settings()
+        return {"available": True, "reason": None, "backend": "capture",
+                "monitor_label": "Mac audio", "mic": None if st["mic"] == "off" else "default",
+                "mic_label": "default input", "settings": st, "devices": []}
     missing = [t for t in ("ffmpeg", "pactl") if not shutil.which(t)]
     if missing:
         return {"available": False, "reason": f"needs {', '.join(missing)} on PATH (PipeWire/PulseAudio + ffmpeg)"}
@@ -223,9 +252,16 @@ def _status(meeting_id):
     channels = rec.get("channels", 1)
     frame = 2 * channels
     bps = RATE * frame
-    running = bool(rec) and rec.get("state") == "recording" and _alive(rec.get("pid"))
+    capture = rec.get("backend") == "capture"
+    if capture:
+        # The page owns the fused.capture recordings; it decides liveness.
+        running = rec.get("state") == "recording"
+        if running:
+            size += int(max(0.0, time.time() - rec.get("started_at", time.time())) * RATE) * frame
+    else:
+        running = bool(rec) and rec.get("state") == "recording" and _alive(rec.get("pid"))
     err = None
-    if rec and rec.get("state") == "recording" and not running:
+    if rec and rec.get("state") == "recording" and not running and not capture:
         # ffmpeg died on its own: surface its last stderr lines.
         try:
             with open(os.path.join(folder, "ffmpeg.log")) as f:
@@ -235,7 +271,7 @@ def _status(meeting_id):
             err = "recorder exited unexpectedly"
     levels = []
     per = []
-    if running:
+    if running and not capture:
         # The last second of the take in progress, for the page's level meter.
         part = os.path.join(folder, "audio.part.pcm")
         n = _size(part) // frame * frame
@@ -257,6 +293,8 @@ def _status(meeting_id):
         "monitor": rec.get("monitor"),
         "mic_device": rec.get("mic_device"),
         "started_at": rec.get("started_at"),
+        "backend": rec.get("backend", "ffmpeg"),
+        "captures": rec.get("captures") or {},
         "wav": wav if os.path.exists(wav) else None,
         "wav_mic": None,
         "wav_system": None,
@@ -331,6 +369,140 @@ def _start(meeting_id, mic):
     return st
 
 
+TAKES = {"system": "take.system.m4a", "mic": "take.mic.m4a"}
+
+
+def _begin(meeting_id, mic):
+    """macOS: open a take the page records with fused.capture; returns its paths."""
+    caps = _capabilities()
+    if not caps["available"]:
+        raise RuntimeError(caps["reason"])
+    current = _read_json(CURRENT, {})
+    if current.get("meeting_id") and current["meeting_id"] != meeting_id:
+        other = _read_json(os.path.join(_folder(current["meeting_id"]), "rec.json"), {})
+        if other.get("state") == "recording":
+            raise RuntimeError(f"already recording meeting {current['meeting_id']}; stop it first")
+    folder = _folder(meeting_id)
+    os.makedirs(folder, exist_ok=True)
+    rec_path = os.path.join(folder, "rec.json")
+    prev = _read_json(rec_path, {})
+    _absorb_takes(folder, prev.get("channels", 1))  # a take left by a crash
+    use_mic = bool(mic and caps.get("mic"))
+    if _size(os.path.join(folder, "audio.pcm")):
+        channels = prev.get("channels", 1)
+    else:
+        channels = 2 if use_mic else 1
+    if channels == 1:
+        use_mic = False  # a mono meeting stays system-only, as on Linux
+    paths = {k: os.path.join(folder, v) for k, v in TAKES.items()}
+    rec = {"backend": "capture", "state": "recording", "started_at": time.time(),
+           "channels": channels, "mic": use_mic, "monitor": "Mac audio",
+           "mic_device": "default input" if use_mic else None, "captures": {}}
+    _write_json(rec_path, rec)
+    _write_json(CURRENT, {"meeting_id": meeting_id, "backend": "capture"})
+    return {"channels": channels, "system": paths["system"], "mic": paths["mic"] if use_mic else None}
+
+
+def _set_captures(meeting_id, ids):
+    """Remember the fused.capture ids of the take so a reloaded page re-attaches."""
+    folder = _folder(meeting_id)
+    rec_path = os.path.join(folder, "rec.json")
+    rec = _read_json(rec_path, {})
+    rec["captures"] = {k: v for k, v in json.loads(ids or "{}").items() if isinstance(v, str)}
+    if not rec["captures"].get("mic"):
+        rec["mic"] = False
+        rec["mic_device"] = None
+    _write_json(rec_path, rec)
+    return _status(meeting_id)
+
+
+def _decode(path):
+    """An .m4a take as 16 kHz mono s16le bytes, via macOS's afconvert."""
+    tmp = os.path.join(CACHE, "decode-" + os.path.basename(os.path.dirname(path)) + "-" + os.path.basename(path) + ".wav")
+    os.makedirs(CACHE, exist_ok=True)
+    try:
+        r = subprocess.run(["afconvert", "-f", "WAVE", "-d", f"LEI16@{RATE}", "-c", "1", path, tmp],
+                           capture_output=True, text=True, timeout=50)
+        if r.returncode != 0:
+            raise RuntimeError(f"could not read {os.path.basename(path)}: {(r.stderr or r.stdout).strip()[-200:]}")
+        with wave.open(tmp, "rb") as w:
+            return w.readframes(w.getnframes())
+    finally:
+        if os.path.exists(tmp):
+            os.remove(tmp)
+
+
+def _interleave(left, right):
+    """Two mono s16le streams -> one stereo stream, the shorter padded with silence."""
+    n = max(len(left), len(right))
+    left, right = left.ljust(n, b"\0"), right.ljust(n, b"\0")
+    if audioop:
+        return audioop.add(audioop.tostereo(left, 2, 1, 0), audioop.tostereo(right, 2, 0, 1), 2)
+    out = array.array("h", bytes(2 * n))
+    out[0::2], out[1::2] = _samples(left), _samples(right)
+    return out.tobytes()
+
+
+def _absorb_takes(folder, channels):
+    """Decode a finished macOS take (take.*.m4a) and append it to audio.pcm."""
+    paths = {k: os.path.join(folder, v) for k, v in TAKES.items()}
+    if not any(_size(p) for p in paths.values()):
+        for p in paths.values():
+            if os.path.exists(p):
+                os.remove(p)
+        return
+    data = {k: _decode(p) if _size(p) else b"" for k, p in paths.items()}
+    if channels == 2:
+        pcm = _interleave(data["mic"], data["system"])
+    else:
+        pcm = data["system"]
+    with open(os.path.join(folder, "audio.pcm"), "ab") as f:
+        f.write(pcm)
+    for p in paths.values():
+        if os.path.exists(p):
+            os.remove(p)
+
+
+def _write_wavs(folder, channels):
+    """audio.wav (+ mic/system for stereo) from audio.pcm without ffmpeg."""
+    pcm = os.path.join(folder, "audio.pcm")
+    names = {"mix": "audio.wav"}
+    if channels == 2:
+        names.update(mic="audio.mic.wav", system="audio.system.wav")
+    tmp = {k: os.path.join(folder, v + ".tmp") for k, v in names.items()}
+    writers = {}
+    for k, p in tmp.items():
+        w = wave.open(p, "wb")
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(RATE)
+        writers[k] = w
+    try:
+        with open(pcm, "rb") as f:
+            while True:
+                chunk = f.read(RATE * 2 * channels * 30)
+                chunk = chunk[:len(chunk) // (2 * channels) * (2 * channels)]
+                if not chunk:
+                    break
+                for k, w in writers.items():
+                    w.writeframes(_downmix(chunk, channels, k))
+    finally:
+        for w in writers.values():
+            w.close()
+    for k, p in tmp.items():
+        os.replace(p, os.path.join(folder, names[k]))
+
+
+def _downmix(data, channels, channel):
+    """One channel of interleaved s16le `data` as mono bytes ("mix" = clipped sum)."""
+    if channels == 1:
+        return data
+    if audioop:
+        fl, fr = {"mic": (1, 0), "system": (0, 1), "mix": (1, 1)}[channel]
+        return audioop.tomono(data, 2, fl, fr)
+    return _mono(_samples(data, 2), 2, channel).tobytes()
+
+
 def _absorb_part(folder):
     """Append a finished take (audio.part.pcm) onto audio.pcm."""
     part = os.path.join(folder, "audio.part.pcm")
@@ -347,6 +519,8 @@ def _stop(meeting_id):
     rec_path = os.path.join(folder, "rec.json")
     rec = _read_json(rec_path, {})
     pid = rec.get("pid")
+    if rec.get("backend") == "capture":
+        pid = None  # the page has already stopped its fused.capture recordings
     if pid and _alive(pid):
         try:
             os.kill(pid, signal.SIGINT)
@@ -368,9 +542,12 @@ def _stop(meeting_id):
     if cur.get("meeting_id") == meeting_id:
         _write_json(CURRENT, {})
     _absorb_part(folder)
+    _absorb_takes(folder, rec.get("channels", 1))
     pcm = os.path.join(folder, "audio.pcm")
     wav = os.path.join(folder, "audio.wav")
-    if _size(pcm) > 0:
+    if _size(pcm) > 0 and not shutil.which("ffmpeg"):
+        _write_wavs(folder, rec.get("channels", 1))
+    elif _size(pcm) > 0:
         channels = rec.get("channels", 1)
         cmd = ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                "-f", "s16le", "-ar", str(RATE), "-ac", str(channels), "-i", pcm]
@@ -450,12 +627,14 @@ def _slice(meeting_id, frm, to, channel="mix", snap=0.0):
             mono = _samples(w.readframes(w.getnframes()))
     else:
         data = _read_span([pcm, part], first * frame, (int(to * RATE) - first) * frame)
-        if channels == 2:
+        if channels == 2 and shutil.which("ffmpeg"):
             data = subprocess.run(
                 ["ffmpeg", "-nostdin", "-hide_banner", "-loglevel", "error",
                  "-f", "s16le", "-ar", str(RATE), "-ac", "2", "-i", "pipe:0",
                  "-af", FILTERS[channel], "-f", "s16le", "-ac", "1", "pipe:1"],
                 input=data, check=True, timeout=30, stdout=subprocess.PIPE).stdout
+        elif channels == 2:
+            data = _downmix(data[:len(data) // 4 * 4], 2, channel)
         mono = _samples(data)
         tmp = out + ".tmp.wav"
         _write_wav(tmp, mono.tobytes())
@@ -475,18 +654,25 @@ def _slice(meeting_id, frm, to, channel="mix", snap=0.0):
 
 def main(action: str = "status", meeting_id: str = "", mic: bool = True,
          frm: float = 0.0, to: float = 0.0, system: str = "", mic_device: str = "",
-         secs: float = 0.5, channel: str = "mix", snap: float = 0.0):
+         secs: float = 0.5, channel: str = "mix", snap: float = 0.0, ids: str = ""):
     if action == "capabilities":
         caps = _capabilities()
         cur = _read_json(CURRENT, {})
-        caps["current"] = cur.get("meeting_id") if cur.get("meeting_id") and _alive(cur.get("pid")) else None
+        live = cur.get("backend") == "capture" or _alive(cur.get("pid"))
+        caps["current"] = cur.get("meeting_id") if cur.get("meeting_id") and live else None
         return caps
     if action == "settings":
         # system / mic_device: "" = follow the system default; mic_device "off" = no mic.
         _write_json(SETTINGS, {"system": system.strip(), "mic": mic_device.strip()})
         return main("capabilities")
+    if action == "begin":
+        return _begin(meeting_id, mic)
+    if action == "captures":
+        return _set_captures(meeting_id, ids)
     if action == "meter":
         caps = _capabilities()
+        if caps.get("backend") == "capture":
+            return {}
         if not caps["available"]:
             raise RuntimeError(caps["reason"])
         return _meter({"system": caps["monitor"], "mic": caps["mic"]}, secs)
