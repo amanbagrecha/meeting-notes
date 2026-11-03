@@ -14,13 +14,13 @@ A local-only meeting recorder for fused-render, modelled on Notion's AI Meeting 
 ## Files
 
 - `index.html` — the whole UI; talks to Python through `fused.runPython` and to local models through `fused.ai`.
-- `recorder.py` — spawns a detached `ffmpeg` that writes the meeting's audio as 16 kHz stereo (left = your mic, right = system audio): on Linux it reads PipeWire (default sink monitor + mic); on macOS it follows the two `.aac` files `fused.capture` is recording. Also slices the growing audio for live transcription.
+- `recorder.py` — spawns a detached `ffmpeg` that writes the meeting's audio as 16 kHz stereo (left = your mic, right = system audio): on Linux it reads PipeWire (default sink monitor + mic); on macOS it follows the `.aac` file `fused.capture` is recording the system audio into and records the mic itself, lined up to it. Also slices the growing audio for live transcription.
 - `meetings.py` — stores each meeting under `.fused/data/meetings/<id>/` (`audio.wav`, `meeting.json`).
 - `SCOPE.md` — design notes and the decisions behind the above.
 
 ## Requirements
 
-- **macOS 13+**: nothing to install. Audio is recorded by fused-render's native capture; the first recording asks for Microphone and System Audio Recording permission. ffmpeg comes bundled through the `imageio-ffmpeg` wheel.
+- **macOS 13+**: nothing to install. System audio is recorded by fused-render's native capture (one recording pill); the first recording asks for System Audio Recording permission. The mic is recorded by the bundled ffmpeg under fused-render's Microphone permission and can be picked in the settings panel. ffmpeg comes bundled through the `imageio-ffmpeg` wheel.
 - **Linux**: PipeWire (or PulseAudio) with `ffmpeg` and `pactl` on PATH. When they are missing, the record card offers an **Install** button that runs the right package-manager command in the terminal.
 
 Both need fused-render's local transcription and text models downloaded (Whisper via faster-whisper, a llama.cpp text model). No network is used at runtime.
