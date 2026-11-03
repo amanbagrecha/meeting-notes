@@ -308,7 +308,7 @@ async function boot() {
   initSettings();
   fused.params.onChange(onParams);
   await refreshList();
-  S.caps = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
+  S.caps = await loadCaps();
   fused.ai.models.catalog().then(c => { S.catalog = c; }).catch(() => {});
   await onParams();
   refreshCalendar();
@@ -341,7 +341,7 @@ async function refreshList() {
 async function openMeeting(id) {
   const my = ++seq;
   stopLoops(); if (S.askDone) S.askDone(null);
-  S.cur = null; S.phase = "idle"; S.progress = null; S.rec = {running: false, seconds: 0, error: null}; S.lastLive = ""; S.search = ""; S.summaryError = null;
+  S.cur = null; S.phase = "idle"; S.progress = null; S.rec = {running: false, seconds: 0, error: null}; S.lastLive = ""; S.search = ""; S.summaryError = null; S.native = null; S.recNote = null;
   render();
   if (!id) return;
   let m;
@@ -357,13 +357,17 @@ async function openMeeting(id) {
   if (my !== seq) return;
   if (st) { S.rec = st; S.rec.error = null; }
   if (m.status === "recording") {
-    if (st && st.running) {
-      S.rec = st; S.phase = "recording";
+    const captures = st && st.running && st.native ? await attachCaptures(st) : null;
+    if (my !== seq) return;
+    if (st && st.running && (!st.native || captures)) {
+      S.rec = st; S.phase = "recording"; S.native = captures;
       S.liveOffset = lastSegmentEnd(m); S.liveLang = m.transcript.language || null;
       startLoops();
     } else {
       S.rec = st || S.rec; S.phase = "idle";
-      S.rec.error = (st && st.error) || "The recorder stopped while the page was away. Finish the meeting to transcribe what was captured.";
+      S.rec.error = (st && st.error) || (st && st.native && st.running
+        ? "The recording was stopped while the page was away. Finish the meeting to transcribe what was captured."
+        : "The recorder stopped while the page was away. Finish the meeting to transcribe what was captured.");
     }
   }
   render();
@@ -392,7 +396,10 @@ async function saveCur(patch) {
 async function deleteCur() {
   if (!S.cur) return;
   if (!confirm(`Delete "${S.cur.title}" and its recording?`)) return;
-  if (S.phase === "recording") await recorder({action: "stop", meeting_id: S.cur.id}).catch(() => {});
+  if (S.phase === "recording" || S.cur.status === "recording") {
+    await endCaptures().catch(() => {});
+    await recorder({action: "stop", meeting_id: S.cur.id}).catch(() => {});
+  }
   stopLoops();
   await store({action: "delete", meeting_id: S.cur.id});
   S.cur = null;
@@ -403,9 +410,9 @@ async function deleteCur() {
 // ---------- recording ----------
 async function startRecording() {
   if (!S.cur || S.phase !== "idle") return;
-  S.rec.error = null; S.phase = "recording"; render();
+  S.rec.error = null; S.recNote = null; S.phase = "recording"; render();
   try {
-    S.rec = await recorder({action: "start", meeting_id: S.cur.id});
+    S.rec = S.caps && S.caps.native ? await startNative(S.cur) : await recorder({action: "start", meeting_id: S.cur.id});
   } catch (e) {
     S.phase = "idle"; S.rec.error = e.message; render(); return;
   }
@@ -413,6 +420,85 @@ async function startRecording() {
   await saveCur({status: "recording"});
   startLoops();
   render();
+}
+
+// macOS: fused.capture records the call audio and the mic into two growing
+// .aac files; recorder.py follows them into the same stereo PCM as on Linux.
+const CAPTURE_MAX_S = 4 * 3600;
+async function loadCaps() {
+  let c = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
+  if (!c.native || !c.available) return c;
+  const src = await fused.capture.sources().catch(e => ({systemAudio: {available: false, reason: e.message}}));
+  const sys = src.systemAudio || {};
+  if (!sys.available) return {...c, available: false, reason: sys.reason || "This Mac cannot record system audio."};
+  const def = (src.microphones || []).find(m => m.default);
+  if (def) {
+    c.default_mic_label = def.name;
+    if (c.mic) c.mic_label = def.name;
+    c.devices = c.devices.map(d => d.name === "default" ? {...d, label: def.name} : d);
+  }
+  return c;
+}
+async function startNative(m) {
+  const files = await recorder({action: "prepare", meeting_id: m.id});
+  const title = m.title || "Meeting";
+  const [sysR, micR] = await Promise.allSettled([
+    fused.capture.audio({source: "system", path: files.system_file, maxSeconds: CAPTURE_MAX_S, title: `${title}: call audio`}),
+    S.caps.mic ? fused.capture.audio({source: "mic", path: files.mic_file, maxSeconds: CAPTURE_MAX_S, title: `${title}: your mic`}) : Promise.resolve(null),
+  ]);
+  const mic = micR.status === "fulfilled" ? micR.value : null;
+  if (sysR.status === "rejected") {
+    if (mic) mic.cancel().catch(() => {});
+    throw sysR.reason;
+  }
+  const sys = sysR.value;
+  try {
+    const st = await recorder({action: "start", meeting_id: m.id, mic: mic ? "true" : "false",
+      system_file: files.system_file, mic_file: mic ? files.mic_file : "", system_capture: sys.id, mic_capture: mic ? mic.id : ""});
+    S.native = {sys, mic, paused: false};
+    if (micR.status === "rejected") S.recNote = `Recording without your mic: ${micR.reason.message}`;
+    return st;
+  } catch (e) {
+    await Promise.allSettled([sys.cancel(), mic && mic.cancel()]);
+    throw e;
+  }
+}
+async function attachCaptures(st) {
+  const live = await fused.capture.list().catch(() => null);
+  if (!live) return null;
+  const sys = live.find(r => r.id === st.system_capture), mic = st.mic_capture ? live.find(r => r.id === st.mic_capture) : null;
+  if (!sys || (st.mic_capture && !mic)) return null;
+  try { return {sys: await fused.capture.attach(sys.id), mic: mic ? await fused.capture.attach(mic.id) : null, paused: !!sys.paused}; }
+  catch (e) { return null; }
+}
+// Stops this meeting's captures (attached, or found by id after a reload) and
+// returns the warning macOS attaches when the system tap heard nothing.
+async function endCaptures() {
+  const n = S.native; S.native = null;
+  let hs = n ? [n.sys, n.mic].filter(Boolean) : [];
+  if (!n && S.rec && S.rec.native) {
+    const live = await fused.capture.list().catch(() => []);
+    const ids = [S.rec.system_capture, S.rec.mic_capture].filter(id => id && live.some(r => r.id === id));
+    hs = (await Promise.all(ids.map(id => fused.capture.attach(id).catch(() => null)))).filter(Boolean);
+  }
+  const res = await Promise.allSettled(hs.map(h => h.stop()));
+  return res.map(r => r.status === "fulfilled" && r.value && r.value.warning).find(Boolean) || null;
+}
+// The recording pills can stop or pause one capture on their own: a stop (or
+// reaching maxSeconds) ends the meeting's recording, a pause is applied to
+// both so mic and call audio stay in step.
+async function watchCaptures() {
+  const n = S.native; if (!n) return;
+  const live = await fused.capture.list().catch(() => null);
+  if (!live || n !== S.native || S.phase !== "recording") return;
+  const sys = live.find(r => r.id === n.sys.id), mic = n.mic ? live.find(r => r.id === n.mic.id) : null;
+  if (!sys || (n.mic && !mic)) { stopRecording(); return; }
+  const want = !!sys.paused !== n.paused ? !!sys.paused : (mic ? !!mic.paused : n.paused);
+  const ops = [];
+  if (!!sys.paused !== want) ops.push(want ? n.sys.pause() : n.sys.resume());
+  if (mic && !!mic.paused !== want) ops.push(want ? n.mic.pause() : n.mic.resume());
+  await Promise.allSettled(ops);
+  if (want !== n.paused) { n.paused = want; S.loudAt = Date.now(); renderCard(); }
 }
 
 function startLoops() {
@@ -445,8 +531,10 @@ async function pollStatus() {
     renderQuiet();
     if (!st.running) { // died on its own
       stopLoops(); S.phase = "idle"; S.rec.error = st.error || "The recorder stopped unexpectedly.";
+      endCaptures().catch(() => {});
     }
     renderTimer();
+    if (st.running) await watchCaptures();
   } catch (e) { /* transient */ }
   finally { polling = false; }
 }
@@ -536,6 +624,8 @@ async function stopRecording() {
   stopLoops();
   S.phase = "finishing"; render();
   const id = S.cur.id, my = seq;
+  const warning = await endCaptures().catch(() => null);
+  if (warning) S.recNote = warning;
   let st;
   try { st = await recorder({action: "stop", meeting_id: id}); }
   catch (e) { S.phase = "idle"; S.rec.error = e.message; render(); return; }
@@ -549,6 +639,8 @@ async function finishStale() { // recorder died while away: wrap what exists and
   if (!S.cur) return;
   S.phase = "finishing"; S.rec.error = null; render();
   const my = seq;
+  const warning = await endCaptures().catch(() => null);
+  if (warning) S.recNote = warning;
   try { S.rec = await recorder({action: "stop", meeting_id: S.cur.id}); }
   catch (e) { S.phase = "idle"; S.rec.error = e.message; render(); return; }
   if (my !== seq) return;
@@ -1021,7 +1113,7 @@ setInterval(() => {
 
 function renderQuiet() {
   const q = $("#quiet"); if (!q) return;
-  const silent = S.phase === "recording" && Date.now() - (S.loudAt || Date.now()) > 10000;
+  const silent = S.phase === "recording" && !(S.native && S.native.paused) && Date.now() - (S.loudAt || Date.now()) > 10000;
   q.hidden = !silent;
   if (silent) q.innerHTML = `No sound has reached the recorder for ${Math.round((Date.now() - S.loudAt) / 1000)}s. Check the devices in <button class="link" id="quiet-link">audio settings</button>.`;
   const l = $("#quiet-link"); if (l) l.addEventListener("click", e => { e.stopPropagation(); openSettings(); });
@@ -1050,7 +1142,7 @@ async function openSettings() {
   panel.hidden = false; $("#settings-btn").classList.add("open");
   renderSettings();
   // Re-read devices: a headset may have connected since the page loaded.
-  S.caps = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
+  S.caps = await loadCaps();
   if (panel.hidden) return;
   renderSettings(); renderCard();
   meterLoop();
@@ -1061,7 +1153,7 @@ function closeSettings() {
 }
 async function meterLoop() {
   const my = ++meterRun;
-  while (my === meterRun && S.caps && S.caps.available) {
+  while (my === meterRun && S.caps && S.caps.available && !S.caps.native) {
     try {
       const r = await recorder({action: "meter", secs: "0.8"}, "meter");
       if (my !== meterRun) return;
@@ -1081,6 +1173,16 @@ function renderSettings() {
   const c = S.caps;
   if (!c || !c.available) {
     el.innerHTML = head + `<p class="hint">${esc(c ? c.reason : "Checking devices…")}</p>`;
+  } else if (c.native) {
+    const st = c.settings || {mic: ""};
+    const opt = (v, text, sel) => `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(text)}</option>`;
+    el.innerHTML = head + `
+      <div class="set-row"><label for="set-system">System audio <span>· what others say</span></label>
+        <div class="set-line"><select class="sel" id="set-system" disabled>${opt("", "Everything this Mac plays", "")}</select></div><div class="set-err" id="err-system"></div></div>
+      <div class="set-row"><label for="set-mic">Microphone <span>· what you say</span></label>
+        <div class="set-line"><select class="sel" id="set-mic">${opt("", `Default input (${c.default_mic_label || "none"})`, st.mic)}${opt("off", "Off: don't record my mic", st.mic)}</select></div><div class="set-err" id="err-mic"></div></div>
+      <p class="hint">macOS records the input picked in System Settings › Sound. The first recording asks for Microphone and System Audio Recording permission; sound levels show on the card once recording starts.${S.phase === "recording" ? " Changes apply to the next recording." : ""}</p>`;
+    $("#set-mic").addEventListener("change", saveSettings);
   } else {
     const devs = c.devices || [], st = c.settings || {system: "", mic: ""};
     const opt = (v, text, sel) => `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(text)}</option>`;
@@ -1103,11 +1205,22 @@ function renderSettings() {
 }
 async function saveSettings() {
   const system = $("#set-system").value, mic_device = $("#set-mic").value;
-  try { S.caps = await recorder({action: "settings", system, mic_device}); }
+  try { await recorder({action: "settings", system, mic_device}); S.caps = await loadCaps(); }
   catch (e) { const el = $("#err-system"); if (el) el.textContent = e.message; return; }
   resetMeter("m-system"); resetMeter("m-mic");
   renderSettings(); renderCard();
   meterLoop(); // restart on the new devices
+}
+
+async function installTools() {
+  const cmd = S.caps && S.caps.install; if (!cmd) return;
+  try { await fused.terminal.run(cmd); S.rec.error = null; }
+  catch (e) { S.rec.error = `Could not open the terminal (${e.message}). Run this yourself: ${cmd}`; }
+  renderCard();
+}
+async function recheckCaps() {
+  S.caps = await loadCaps();
+  renderCard(); renderSettings();
 }
 
 function micIcon() { return `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg>`; }
@@ -1119,7 +1232,8 @@ function renderCard() {
   let right = "", sub = "", extra = "";
   if (ph === "recording") {
     right = `${meterHTML("card-meter")}<span class="timer"><span class="dot recording"></span><span id="timer">${fmtTime(S.rec.seconds)}</span></span><button class="btn danger" id="stop-btn">Stop</button>`;
-    sub = `Recording ${esc(deviceLabel(S.rec.monitor) || "system audio")}${S.rec.mic ? " + " + esc(deviceLabel(S.rec.mic_device) || "mic") + " mic" : ""}. Transcript updates every few seconds.`;
+    sub = S.native && S.native.paused ? "Paused. Resume from the recording pill."
+      : `Recording ${esc(deviceLabel(S.rec.monitor) || "system audio")}${S.rec.mic ? " + " + esc(deviceLabel(S.rec.mic_device) || "mic") + " mic" : ""}. Transcript updates every few seconds.`;
     extra = `<div class="live" id="live">${liveHTML()}</div><div class="warn" id="quiet" hidden></div>`;
   } else if (ph === "asking") {
     right = `<label class="people">People in call <input id="ask-n" type="number" min="1" max="100" step="1" placeholder="${S.rec.wav_mic ? "you + others" : "count"}" /></label><button class="btn primary" id="ask-go">Continue</button><button class="btn small" id="ask-skip">Let it guess</button>`;
@@ -1133,8 +1247,8 @@ function renderCard() {
       : "Step 2 of 2: the local language model is writing your notes.";
     extra = `<div class="progress ${S.progress && S.progress.total ? "" : "indet"}"><div id="prog-bar"></div></div>${ph === "transcribing" ? `<div class="live" id="live">${liveHTML()}</div>` : ""}`;
   } else if (!caps.available) {
-    right = `<button class="btn primary" disabled>Record</button>`;
-    sub = caps.reason || "Recording unavailable on this machine.";
+    right = `${caps.install ? `<button class="btn" id="install-btn" title="${esc(caps.install)}">Install</button>` : ""}${S.caps ? `<button class="btn small" id="recheck-btn">Check again</button>` : ""}<button class="btn primary" disabled>Record</button>`;
+    sub = esc(caps.reason || "Recording unavailable on this machine.") + (caps.install ? `. Install runs <code>${esc(caps.install)}</code> in the terminal.` : "");
   } else if (S.cur.status === "recording") {
     right = `<button class="btn primary" id="finish-btn">Finish meeting</button>`;
     sub = "This meeting was recording when the page was closed.";
@@ -1144,7 +1258,9 @@ function renderCard() {
     const devs = `${esc(caps.monitor_label || "system audio")}${caps.mic ? " + " + esc(caps.mic_label) + " mic" : ", no mic"}`;
     sub = (has ? `${fmtDur(S.cur.duration_s)} recorded${S.cur.transcript.final ? ", transcribed with speakers" : ""}. Next take: ${devs}.` : `Captures ${devs}.`) + ` <button class="link" id="dev-link">Change</button>`;
   }
-  el.innerHTML = `<div class="card-row"><div class="lead"><div class="ico">${micIcon()}</div><div class="txt"><b>AI meeting notes</b><span>${sub}</span></div></div>${right}</div>${extra}${S.rec.error ? `<div class="warn">${esc(S.rec.error)}</div>` : ""}`;
+  el.innerHTML = `<div class="card-row"><div class="lead"><div class="ico">${micIcon()}</div><div class="txt"><b>AI meeting notes</b><span>${sub}</span></div></div>${right}</div>${extra}${S.rec.error ? `<div class="warn">${esc(S.rec.error)}</div>` : ""}${S.recNote ? `<div class="warn">${esc(S.recNote)}</div>` : ""}`;
+  const ib = $("#install-btn"); if (ib) ib.addEventListener("click", installTools);
+  const rb = $("#recheck-btn"); if (rb) rb.addEventListener("click", recheckCaps);
   const r = $("#rec-btn"); if (r) r.addEventListener("click", startRecording);
   const s = $("#stop-btn"); if (s) s.addEventListener("click", stopRecording);
   const f = $("#finish-btn"); if (f) f.addEventListener("click", finishStale);
