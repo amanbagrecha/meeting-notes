@@ -11,9 +11,10 @@ stereo existed, mono; `rec.json` keeps that as `channels`, fixed by the first
 take. `stop` wraps the audio into `audio.wav` (mono mix for playback and
 transcription) plus, for stereo, `audio.mic.wav` and `audio.system.wav`.
 
-On macOS the page records the system audio and the mic with fused.capture into
-two ADTS `.aac` take files (readable while they grow), and the detached ffmpeg
-follows those files instead of reading PulseAudio devices.
+On macOS the page records the system audio with fused.capture into an ADTS
+`.aac` take file (readable while it grows); the detached ffmpeg follows that
+file and records the mic itself over AVFoundation, padding the mic's start so
+both channels begin at the moment the system capture started.
 """
 
 import array
@@ -193,19 +194,52 @@ def _capabilities():
             "settings": st, "devices": devices}
 
 
+def _mac_mics():
+    """AVFoundation audio input names, as ffmpeg lists them."""
+    try:
+        err = subprocess.run([FFMPEG, "-hide_banner", "-f", "avfoundation", "-list_devices", "true", "-i", ""],
+                             capture_output=True, text=True, timeout=10).stderr
+    except (OSError, subprocess.TimeoutExpired):
+        return []
+    names, audio = [], False
+    for line in err.splitlines():
+        if "AVFoundation audio devices" in line:
+            audio = True
+        elif "AVFoundation video devices" in line:
+            audio = False
+        else:
+            m = re.search(r"\] \[\d+\] (.+)$", line)
+            if audio and m:
+                names.append(m.group(1).strip())
+    return names
+
+
 def _mac_capabilities():
-    """macOS: the page records with fused.capture; ffmpeg only follows and slices."""
+    """macOS: the page records system audio with fused.capture; ffmpeg records the mic."""
     if not FFMPEG:
         return {"available": False, "install": _install_command(["ffmpeg"]),
                 "reason": "needs ffmpeg (the app's Python environment did not install imageio-ffmpeg)"}
-    mic_off = _settings()["mic"] == "off"
-    devices = [{"name": "system", "label": "Mac system audio", "monitor": True},
-               {"name": "default", "label": "default input", "monitor": False}]
+    st = _settings()
+    mics = _mac_mics()
+    devices = ([{"name": "system", "label": "Mac system audio", "monitor": True},
+                {"name": "default", "label": "default input", "monitor": False}]
+               + [{"name": n, "label": n, "monitor": False} for n in mics])
+    if st["mic"] == "off" or not mics:
+        mic = None
+    else:
+        mic = st["mic"] if st["mic"] in mics else "default"
     return {"available": True, "reason": None, "native": True, "sink": None,
             "monitor": "system", "monitor_label": "Mac system audio",
-            "mic": None if mic_off else "default", "mic_label": None if mic_off else "default input",
+            "mic": mic, "mic_label": ("default input" if mic == "default" else mic) if mic else None,
             "default_monitor": "system", "default_mic": "default",
-            "settings": {"system": "", "mic": "off" if mic_off else ""}, "devices": devices}
+            "settings": {"system": "", "mic": st["mic"]}, "devices": devices}
+
+
+def _mic_input(dev):
+    if DARWIN:
+        return ["-thread_queue_size", "4096", "-use_wallclock_as_timestamps", "1",
+                "-f", "avfoundation", "-i", "none:" + dev]
+    return ["-f", "pulse", "-i", dev]
 
 
 def _samples(data, channels=1):
@@ -255,8 +289,9 @@ def _meter(devices, secs):
     for key, dev in devices.items():
         if not dev:
             continue
+        src = _mic_input(dev) if key == "mic" else ["-f", "pulse", "-i", dev]
         procs[key] = subprocess.Popen(
-            [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error", "-f", "pulse", "-i", dev,
+            [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "error"] + src + [
              "-t", str(secs), "-ac", "1", "-ar", str(RATE), "-f", "s16le", "-"],
             stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     out = {}
@@ -325,7 +360,6 @@ def _status(meeting_id):
         "error": err,
         "native": bool(rec.get("native")),
         "system_capture": rec.get("system_capture"),
-        "mic_capture": rec.get("mic_capture"),
     }
     if channels == 2:
         out["levels_mic"], out["levels_system"] = per if per else ([], [])
@@ -335,7 +369,7 @@ def _status(meeting_id):
     return out
 
 
-_TAKE = re.compile(r"^take-\d{8}-\d{6}\.(system|mic)\.aac$")
+_TAKE = re.compile(r"^take-\d{8}-\d{6}\.system\.aac$")
 
 
 def _is_take(folder, path):
@@ -352,32 +386,39 @@ def _check_busy(meeting_id):
 
 
 def _prepare(meeting_id):
-    """macOS: where the page's two fused.capture recordings write this take."""
+    """macOS: where the page's fused.capture recording writes this take."""
     if not DARWIN:
         raise RuntimeError("prepare is only used for macOS captures")
     _check_busy(meeting_id)
     folder = _folder(meeting_id)
     os.makedirs(folder, exist_ok=True)
     stamp = time.strftime("%Y%m%d-%H%M%S")
-    return {"system_file": os.path.join(folder, f"take-{stamp}.system.aac"),
-            "mic_file": os.path.join(folder, f"take-{stamp}.mic.aac")}
+    return {"system_file": os.path.join(folder, f"take-{stamp}.system.aac")}
 
 
 def _follow(path, live=True):
     return (["-follow", "1"] if live else []) + ["-f", "aac", "-i", "file:" + path]
 
 
-def _capture_cmd(sys_in, mic_in, channels, out):
+def _capture_cmd(sys_in, mic_in, channels, out, mic_t0=None):
+    """`mic_t0`: epoch seconds the system audio started; the mic is padded to it."""
     mono = f"aresample={RATE},aformat=channel_layouts=mono"
-    cmd = [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "warning"] + sys_in
+    head = [FFMPEG, "-nostdin", "-hide_banner", "-loglevel", "warning"]
+    mic_chain = mono
+    if mic_in and mic_t0 is not None:
+        head.append("-copyts")
+        mic_chain = (f"asetpts=N/SR/TB+STARTPTS-{mic_t0:.6f}/TB,aresample={RATE}:async=1:first_pts=0,"
+                     "aformat=channel_layouts=mono,apad")
+    cmd = head + sys_in
     if mic_in and channels == 2:
         cmd += mic_in + ["-filter_complex",
-                         f"[0:a]{mono}[sys];[1:a]{mono}[mic];"
+                         f"[0:a]{mono}[sys];[1:a]{mic_chain}[mic];"
                          "[mic][sys]join=inputs=2:channel_layout=stereo:map=0.0-FL|1.0-FR[a]",
                          "-map", "[a]"]
     elif mic_in:
         cmd += mic_in + ["-filter_complex",
-                         f"[0:a][1:a]amix=inputs=2:duration=longest:dropout_transition=0,aresample={RATE}[a]",
+                         f"[1:a]{mic_chain}[mic];"
+                         f"[0:a][mic]amix=inputs=2:duration=first:dropout_transition=0,aresample={RATE}[a]",
                          "-map", "[a]"]
     elif channels == 2:  # no mic this take: keep the left channel silent so takes line up
         cmd += ["-filter_complex", f"[0:a]{mono},pan=stereo|c0=0*c0|c1=c0[a]", "-map", "[a]"]
@@ -388,7 +429,7 @@ def _capture_cmd(sys_in, mic_in, channels, out):
     return cmd
 
 
-def _start(meeting_id, mic, system_file="", mic_file="", system_capture="", mic_capture=""):
+def _start(meeting_id, mic, system_file="", system_capture="", started_at=0.0):
     caps = _capabilities()
     if not caps["available"]:
         raise RuntimeError(caps["reason"])
@@ -403,40 +444,49 @@ def _start(meeting_id, mic, system_file="", mic_file="", system_capture="", mic_
     # overwriting it (ffmpeg cannot append).
     part = os.path.join(folder, "audio.part.pcm")
     _close_take(folder, _read_json(os.path.join(folder, "rec.json"), {}), False)
+    use_mic = bool(mic and caps.get("mic"))
+    mic_in = _mic_input(caps["mic"]) if use_mic else []
     if DARWIN:
         if not (system_file and _is_take(folder, system_file) and os.path.exists(system_file)):
             raise RuntimeError("the system-audio capture file is missing; start it with fused.capture first")
-        use_mic = bool(mic and mic_file and _is_take(folder, mic_file) and os.path.exists(mic_file))
         sys_in = _follow(system_file)
-        mic_in = _follow(mic_file) if use_mic else []
     else:
-        use_mic = bool(mic and caps.get("mic"))
         sys_in = ["-f", "pulse", "-i", caps["monitor"]]
-        mic_in = ["-f", "pulse", "-i", caps["mic"]] if use_mic else []
     # The first take fixes the layout: stereo (L mic, R system) if it has a mic.
     if _size(os.path.join(folder, "audio.pcm")):
         channels = _read_json(os.path.join(folder, "rec.json"), {}).get("channels", 1)
     else:
         channels = 2 if use_mic else 1
-    cmd = _capture_cmd(sys_in, mic_in, channels, part)
+    t0 = (float(started_at) or time.time()) if DARWIN else None
+    st = _launch(meeting_id, folder, _capture_cmd(sys_in, mic_in, channels, part, t0), caps, channels, use_mic,
+                 system_file, system_capture)
+    if not st["running"] and DARWIN and use_mic:
+        mic_error = st["error"]
+        st = _launch(meeting_id, folder, _capture_cmd(sys_in, [], channels, part), caps, channels, False,
+                     system_file, system_capture)
+        st["mic_error"] = mic_error or "the microphone could not be opened"
+    if not st["running"]:
+        rec_path = os.path.join(folder, "rec.json")
+        rec = _read_json(rec_path, {})
+        rec["state"] = "failed"
+        _write_json(rec_path, rec)
+        raise RuntimeError(st["error"] or "ffmpeg failed to start")
+    return st
+
+
+def _launch(meeting_id, folder, cmd, caps, channels, use_mic, system_file, system_capture):
     log = open(os.path.join(folder, "ffmpeg.log"), "ab")
     proc = subprocess.Popen(cmd, start_new_session=True, stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=log, close_fds=True)
     rec = {"pid": proc.pid, "state": "recording", "started_at": time.time(),
            "channels": channels, "mic": use_mic, "monitor": caps["monitor"], "mic_device": caps["mic"] if use_mic else None}
     if DARWIN:
-        rec.update(native=True, system_file=system_file, mic_file=mic_file if use_mic else None,
-                   system_capture=system_capture or None, mic_capture=(mic_capture or None) if use_mic else None)
+        rec.update(native=True, system_file=system_file, system_capture=system_capture or None)
     _write_json(os.path.join(folder, "rec.json"), rec)
     _write_json(CURRENT, {"meeting_id": meeting_id, "pid": proc.pid})
     # Give ffmpeg a moment to fail fast on a bad device.
     time.sleep(0.6)
-    st = _status(meeting_id)
-    if not st["running"]:
-        rec["state"] = "failed"
-        _write_json(os.path.join(folder, "rec.json"), rec)
-        raise RuntimeError(st["error"] or "ffmpeg failed to start")
-    return st
+    return _status(meeting_id)
 
 
 def _absorb_part(folder):
@@ -463,29 +513,33 @@ def _settle(path, quiet=1.0, limit=15.0):
 def _close_take(folder, rec, followed):
     """Fold the take in progress into audio.pcm.
 
-    A macOS take whose follower died early is decoded again from its capture
-    files, which hold the whole take; its files are removed once absorbed.
+    A macOS take file is removed once absorbed, unless its follower had died
+    (the file may hold call audio the follower never read).
     """
-    takes = [rec.get(k) for k in ("system_file", "mic_file")]
-    takes = [p for p in takes if p and _is_take(folder, p) and os.path.exists(p)]
-    if rec.get("native") and rec.get("state") == "recording" and not followed and takes:
-        system = rec.get("system_file")
-        if system in takes:
-            mic = rec.get("mic_file") if rec.get("mic_file") in takes else None
-            cmd = _capture_cmd(_follow(system, False), _follow(mic, False) if mic else [],
-                               rec.get("channels", 1), os.path.join(folder, "audio.part.pcm"))
-            try:
-                subprocess.run(cmd, check=True, timeout=40, stdin=subprocess.DEVNULL,
-                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except (OSError, subprocess.SubprocessError):
-                pass
     _absorb_part(folder)
-    if rec.get("native"):
-        for p in takes:
-            try:
-                os.remove(p)
-            except OSError:
-                pass
+    path = rec.get("system_file")
+    if rec.get("native") and path and _is_take(folder, path) and (followed or rec.get("state") != "recording"):
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+
+
+def _signal(pid, sig):
+    try:
+        os.kill(pid, sig)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
+def _pause(meeting_id, paused):
+    """macOS: freeze the follower while the system capture is paused, so the
+    mic is not recorded either and both channels stay in step."""
+    rec = _read_json(os.path.join(_folder(meeting_id), "rec.json"), {})
+    pid = rec.get("pid")
+    if rec.get("native") and rec.get("state") == "recording" and _alive(pid):
+        _signal(pid, signal.SIGSTOP if paused else signal.SIGCONT)
+    return _status(meeting_id)
 
 
 def _stop(meeting_id):
@@ -495,9 +549,10 @@ def _stop(meeting_id):
     pid = rec.get("pid")
     followed = bool(pid and _alive(pid))
     if followed:
-        # A macOS follower waits at the end of its files for more audio and
+        # A macOS follower waits at the end of its file for more audio and
         # ignores SIGINT there, so let it drain, then kill it.
         if rec.get("native"):
+            _signal(pid, signal.SIGCONT)
             _settle(os.path.join(folder, "audio.part.pcm"))
         try:
             os.kill(pid, signal.SIGKILL if rec.get("native") else signal.SIGINT)
@@ -627,7 +682,7 @@ def _slice(meeting_id, frm, to, channel="mix", snap=0.0):
 def main(action: str = "status", meeting_id: str = "", mic: bool = True,
          frm: float = 0.0, to: float = 0.0, system: str = "", mic_device: str = "",
          secs: float = 0.5, channel: str = "mix", snap: float = 0.0,
-         system_file: str = "", mic_file: str = "", system_capture: str = "", mic_capture: str = ""):
+         system_file: str = "", system_capture: str = "", started_at: float = 0.0):
     if action == "capabilities":
         caps = _capabilities()
         cur = _read_json(CURRENT, {})
@@ -642,14 +697,16 @@ def main(action: str = "status", meeting_id: str = "", mic: bool = True,
         if not caps["available"]:
             raise RuntimeError(caps["reason"])
         if DARWIN:
-            raise RuntimeError("on macOS sound levels show once a recording starts")
+            return _meter({"mic": caps["mic"]}, secs)
         return _meter({"system": caps["monitor"], "mic": caps["mic"]}, secs)
     if action == "status":
         return _status(meeting_id)
     if action == "prepare":
         return _prepare(meeting_id)
     if action == "start":
-        return _start(meeting_id, mic, system_file, mic_file, system_capture, mic_capture)
+        return _start(meeting_id, mic, system_file, system_capture, started_at)
+    if action in ("pause", "resume"):
+        return _pause(meeting_id, action == "pause")
     if action == "stop":
         return _stop(meeting_id)
     if action == "slice":

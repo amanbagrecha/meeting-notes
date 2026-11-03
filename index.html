@@ -422,8 +422,9 @@ async function startRecording() {
   render();
 }
 
-// macOS: fused.capture records the call audio and the mic into two growing
-// .aac files; recorder.py follows them into the same stereo PCM as on Linux.
+// macOS: fused.capture records the call audio into a growing .aac file;
+// recorder.py follows it and records the mic itself, lined up to the moment
+// the capture started.
 const CAPTURE_MAX_S = 4 * 3600;
 async function loadCaps() {
   let c = await recorder({action: "capabilities"}).catch(e => ({available: false, reason: e.message}));
@@ -434,72 +435,60 @@ async function loadCaps() {
   const def = (src.microphones || []).find(m => m.default);
   if (def) {
     c.default_mic_label = def.name;
-    if (c.mic) c.mic_label = def.name;
+    if (c.mic === "default") c.mic_label = def.name;
     c.devices = c.devices.map(d => d.name === "default" ? {...d, label: def.name} : d);
   }
   return c;
 }
 async function startNative(m) {
-  const files = await recorder({action: "prepare", meeting_id: m.id});
-  const title = m.title || "Meeting";
-  const [sysR, micR] = await Promise.allSettled([
-    fused.capture.audio({source: "system", path: files.system_file, maxSeconds: CAPTURE_MAX_S, title: `${title}: call audio`}),
-    S.caps.mic ? fused.capture.audio({source: "mic", path: files.mic_file, maxSeconds: CAPTURE_MAX_S, title: `${title}: your mic`}) : Promise.resolve(null),
-  ]);
-  const mic = micR.status === "fulfilled" ? micR.value : null;
-  if (sysR.status === "rejected") {
-    if (mic) mic.cancel().catch(() => {});
-    throw sysR.reason;
-  }
-  const sys = sysR.value;
+  const {system_file} = await recorder({action: "prepare", meeting_id: m.id});
+  const sys = await fused.capture.audio({source: "system", path: system_file, maxSeconds: CAPTURE_MAX_S, title: m.title || "Meeting"});
+  const startedAt = Date.now() / 1000;
   try {
-    const st = await recorder({action: "start", meeting_id: m.id, mic: mic ? "true" : "false",
-      system_file: files.system_file, mic_file: mic ? files.mic_file : "", system_capture: sys.id, mic_capture: mic ? mic.id : ""});
-    S.native = {sys, mic, paused: false};
-    if (micR.status === "rejected") S.recNote = `Recording without your mic: ${micR.reason.message}`;
+    const st = await recorder({action: "start", meeting_id: m.id, mic: S.caps.mic ? "true" : "false",
+      system_file, system_capture: sys.id, started_at: String(startedAt)});
+    S.native = {sys, paused: false};
+    if (st.mic_error) S.recNote = `Recording without your mic: ${st.mic_error}`;
     return st;
   } catch (e) {
-    await Promise.allSettled([sys.cancel(), mic && mic.cancel()]);
+    await sys.cancel().catch(() => {});
     throw e;
   }
 }
 async function attachCaptures(st) {
   const live = await fused.capture.list().catch(() => null);
-  if (!live) return null;
-  const sys = live.find(r => r.id === st.system_capture), mic = st.mic_capture ? live.find(r => r.id === st.mic_capture) : null;
-  if (!sys || (st.mic_capture && !mic)) return null;
-  try { return {sys: await fused.capture.attach(sys.id), mic: mic ? await fused.capture.attach(mic.id) : null, paused: !!sys.paused}; }
+  const row = live && live.find(r => r.id === st.system_capture);
+  if (!row) return null;
+  try { return {sys: await fused.capture.attach(row.id), paused: null}; }
   catch (e) { return null; }
 }
-// Stops this meeting's captures (attached, or found by id after a reload) and
+// Stops this meeting's capture (attached, or found by id after a reload) and
 // returns the warning macOS attaches when the system tap heard nothing.
 async function endCaptures() {
   const n = S.native; S.native = null;
-  let hs = n ? [n.sys, n.mic].filter(Boolean) : [];
-  if (!n && S.rec && S.rec.native) {
+  let h = n ? n.sys : null;
+  if (!h && S.rec && S.rec.native && S.rec.system_capture) {
     const live = await fused.capture.list().catch(() => []);
-    const ids = [S.rec.system_capture, S.rec.mic_capture].filter(id => id && live.some(r => r.id === id));
-    hs = (await Promise.all(ids.map(id => fused.capture.attach(id).catch(() => null)))).filter(Boolean);
+    if (live.some(r => r.id === S.rec.system_capture)) h = await fused.capture.attach(S.rec.system_capture).catch(() => null);
   }
-  const res = await Promise.allSettled(hs.map(h => h.stop()));
-  return res.map(r => r.status === "fulfilled" && r.value && r.value.warning).find(Boolean) || null;
+  if (!h) return null;
+  const done = await h.stop().catch(() => null);
+  return (done && done.warning) || null;
 }
-// The recording pills can stop or pause one capture on their own: a stop (or
-// reaching maxSeconds) ends the meeting's recording, a pause is applied to
-// both so mic and call audio stay in step.
+// The recording pill can stop or pause the capture on its own: a stop (or
+// reaching maxSeconds) ends the meeting's recording; a pause freezes the mic
+// too so both channels stay in step.
 async function watchCaptures() {
   const n = S.native; if (!n) return;
   const live = await fused.capture.list().catch(() => null);
   if (!live || n !== S.native || S.phase !== "recording") return;
-  const sys = live.find(r => r.id === n.sys.id), mic = n.mic ? live.find(r => r.id === n.mic.id) : null;
-  if (!sys || (n.mic && !mic)) { stopRecording(); return; }
-  const want = !!sys.paused !== n.paused ? !!sys.paused : (mic ? !!mic.paused : n.paused);
-  const ops = [];
-  if (!!sys.paused !== want) ops.push(want ? n.sys.pause() : n.sys.resume());
-  if (mic && !!mic.paused !== want) ops.push(want ? n.mic.pause() : n.mic.resume());
-  const res = await Promise.allSettled(ops);
-  if (res.some(r => r.status === "rejected")) return;
-  if (want !== n.paused) { n.paused = want; S.loudAt = Date.now(); renderCard(); }
+  const row = live.find(r => r.id === n.sys.id);
+  if (!row) { stopRecording(); return; }
+  const want = !!row.paused;
+  if (want === n.paused) return;
+  try { await recorder({action: want ? "pause" : "resume", meeting_id: S.cur.id}, "pause"); }
+  catch (e) { return; }
+  n.paused = want; S.loudAt = Date.now(); renderCard();
 }
 
 function startLoops() {
@@ -1154,7 +1143,7 @@ function closeSettings() {
 }
 async function meterLoop() {
   const my = ++meterRun;
-  while (my === meterRun && S.caps && S.caps.available && !S.caps.native) {
+  while (my === meterRun && S.caps && S.caps.available) {
     try {
       const r = await recorder({action: "meter", secs: "0.8"}, "meter");
       if (my !== meterRun) return;
@@ -1177,12 +1166,15 @@ function renderSettings() {
   } else if (c.native) {
     const st = c.settings || {mic: ""};
     const opt = (v, text, sel) => `<option value="${esc(v)}"${v === sel ? " selected" : ""}>${esc(text)}</option>`;
+    const mics = (c.devices || []).filter(d => !d.monitor && d.name !== "default");
+    const gone = st.mic && st.mic !== "off" && !mics.some(d => d.name === st.mic) ? opt(st.mic, st.mic + " (not connected)", st.mic) : "";
+    const mic = opt("", `Default input (${c.default_mic_label || "none"})`, st.mic) + gone + mics.map(d => opt(d.name, d.label, st.mic)).join("") + opt("off", "Off: don't record my mic", st.mic);
     el.innerHTML = head + `
       <div class="set-row"><label for="set-system">System audio <span>· what others say</span></label>
         <div class="set-line"><select class="sel" id="set-system" disabled>${opt("", "Everything this Mac plays", "")}</select></div><div class="set-err" id="err-system"></div></div>
       <div class="set-row"><label for="set-mic">Microphone <span>· what you say</span></label>
-        <div class="set-line"><select class="sel" id="set-mic">${opt("", `Default input (${c.default_mic_label || "none"})`, st.mic)}${opt("off", "Off: don't record my mic", st.mic)}</select></div><div class="set-err" id="err-mic"></div></div>
-      <p class="hint">macOS records the input picked in System Settings › Sound. The first recording asks for Microphone and System Audio Recording permission; sound levels show on the card once recording starts.${S.phase === "recording" ? " Changes apply to the next recording." : ""}</p>`;
+        <div class="set-line"><select class="sel" id="set-mic">${mic}</select>${meterHTML("m-mic", 20)}</div><div class="set-err" id="err-mic"></div></div>
+      <p class="hint">Bars light up when your voice reaches the recorder. System audio levels show on the card once recording starts; the first recording asks macOS for System Audio Recording permission.${S.phase === "recording" ? " Changes apply to the next recording." : ""}</p>`;
     $("#set-mic").addEventListener("change", saveSettings);
   } else {
     const devs = c.devices || [], st = c.settings || {system: "", mic: ""};
