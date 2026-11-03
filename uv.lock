@@ -1,6 +1,11 @@
 version = 1
 revision = 5
 requires-python = ">=3.11"
+required-markers = [
+    "platform_machine == 'arm64' and platform_release == '23' and sys_platform == 'darwin'",
+    "platform_machine == 'x86_64' and platform_release == '23' and sys_platform == 'darwin'",
+    "platform_machine == 'x86_64' and sys_platform == 'linux'",
+]
 
 [[package]]
 name = "click"
@@ -26,17 +31,29 @@ wheels = [
 ]
 
 [[package]]
+name = "imageio-ffmpeg"
+version = "0.8.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/d0/c5/2ca1479972cc5f0526d673050ba829518c6db33d9a0d0749892209fdf81d/imageio_ffmpeg-0.8.0.tar.gz", hash = "sha256:0385d9bab7dc7d7141af7d0f160059e05f0d874116faf9ce91f6fcfd66e938f2", size = 26957, upload-time = "2026-11-02T08:50:19.789Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/d4/05/0826fb1538dd3ff10ceb120eccc70fe209b178619678a7a7697bd37bf988/imageio_ffmpeg-0.8.0-py3-none-macosx_10_13_x86_64.whl", hash = "sha256:3c1fdef145531268307c7e995a86b95a460dbb33b406dd34bc7488645d54040b", size = 26974211, upload-time = "2026-11-02T08:49:57.515Z" },
+    { url = "https://files.pythonhosted.org/packages/79/d0/8cab3df2c711ca2af0af8b895ece01b71d6c5fdaeb6d5957a5972c2ae333/imageio_ffmpeg-0.8.0-py3-none-macosx_12_0_arm64.whl", hash = "sha256:9dc65cb8650afdb5b8d6a8c251dbcb6c230a07b041e39326e03cb62bab3e992f", size = 22625305, upload-time = "2026-11-02T08:50:00.466Z" },
+]
+
+[[package]]
 name = "meeting-notes"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "icalendar" },
+    { name = "imageio-ffmpeg", marker = "sys_platform == 'darwin'" },
     { name = "recurring-ical-events" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "icalendar", specifier = ">=6" },
+    { name = "imageio-ffmpeg", marker = "sys_platform == 'darwin'", specifier = ">=0.6" },
     { name = "recurring-ical-events", specifier = ">=3" },
 ]
 

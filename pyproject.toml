@@ -5,7 +5,15 @@ requires-python = ">=3.11"
 dependencies = [
   "icalendar>=6",
   "recurring-ical-events>=3",
+  "imageio-ffmpeg>=0.6; sys_platform == 'darwin'",
 ]
 
 [tool.uv]
 package = false
+no-build = true
+required-version = ">=0.12.17"
+required-environments = [
+  "sys_platform == 'darwin' and platform_machine == 'arm64' and platform_release == '23.0.0'",
+  "sys_platform == 'darwin' and platform_machine == 'x86_64' and platform_release == '23.0.0'",
+  "sys_platform == 'linux' and platform_machine == 'x86_64'",
+]
