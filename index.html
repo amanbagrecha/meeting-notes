@@ -497,7 +497,8 @@ async function watchCaptures() {
   const ops = [];
   if (!!sys.paused !== want) ops.push(want ? n.sys.pause() : n.sys.resume());
   if (mic && !!mic.paused !== want) ops.push(want ? n.mic.pause() : n.mic.resume());
-  await Promise.allSettled(ops);
+  const res = await Promise.allSettled(ops);
+  if (res.some(r => r.status === "rejected")) return;
   if (want !== n.paused) { n.paused = want; S.loudAt = Date.now(); renderCard(); }
 }
 
